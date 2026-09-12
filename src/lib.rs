@@ -4,6 +4,7 @@ pub mod config;
 pub mod format;
 pub mod incremental;
 pub mod pipeline;
+mod progress;
 pub mod publish;
 pub mod schedule;
 pub mod source;

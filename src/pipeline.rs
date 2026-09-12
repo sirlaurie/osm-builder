@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::{
     build,
     config::{Environment, Runtime},
-    format, incremental,
+    format, incremental, progress,
     publish::{ProgressReporter, PublishConfig, Publisher},
     source::{self, Region, ReplicationState},
     storage::{atomic_write, sync_directory},
@@ -133,7 +133,10 @@ impl Downloader {
                     }
                     Err(error) if attempt < runtime.download_retries => {
                         self.check_cancelled()?;
-                        eprintln!("Download attempt {} failed: {error}", attempt + 1);
+                        progress::message(&format!(
+                            "Download attempt {} failed: {error}",
+                            attempt + 1
+                        ));
                         self.interruptible(tokio::time::sleep(runtime.download_retry_delay))
                             .await?;
                     }
@@ -191,21 +194,21 @@ impl Downloader {
             let available = fs2::available_space(path)?;
             if control.foreground.load(Ordering::Acquire) || available >= needed {
                 if paused {
-                    println!(
+                    progress::message(&format!(
                         "Prefetch resumed at {}: {} GiB free",
                         path.display(),
                         available / (1024 * 1024 * 1024)
-                    );
+                    ));
                 }
                 return Ok(started.elapsed());
             }
             if !paused {
-                println!(
+                progress::message(&format!(
                     "Prefetch paused at {}: {} GiB free, {} GiB reserved for current work and remaining download",
                     path.display(),
                     available / (1024 * 1024 * 1024),
                     needed.div_ceil(1024 * 1024 * 1024)
-                );
+                ));
                 paused = true;
             }
             self.interruptible(tokio::time::sleep(Duration::from_secs(1)))
@@ -309,7 +312,7 @@ impl Downloader {
     ) -> Result<()> {
         source::prepare(entry, catalog, job)?;
         let url = entry.source_url();
-        println!("[{}] Downloading initial source: {url}", entry.id);
+        progress::message(&format!("[{}] Downloading initial source: {url}", entry.id));
         self.download(runtime, &url, &job.join("source.osm.pbf"), None)?;
         self.download(
             runtime,

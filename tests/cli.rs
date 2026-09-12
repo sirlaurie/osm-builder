@@ -32,7 +32,7 @@ fn cli_loads_project_through_directory_symlinks_and_holds_an_os_lock() {
     .unwrap();
     fs::write(
         project.join("config/regions.json"),
-        include_str!("../config/regions.json"),
+        r#"{"regions":[{"id":"cn-jiangsu","extract":"asia/china/jiangsu"}]}"#,
     )
     .unwrap();
     fs::write(
@@ -49,8 +49,8 @@ fn cli_loads_project_through_directory_symlinks_and_holds_an_os_lock() {
         String::from_utf8_lossy(&listed.stderr)
     );
     assert_eq!(
-        String::from_utf8(listed.stdout).unwrap().lines().count(),
-        220
+        String::from_utf8(listed.stdout).unwrap(),
+        "cn-jiangsu\tasia/china/jiangsu\n"
     );
     assert!(project.join(".build/tools/tmp").is_dir());
     assert_eq!(
@@ -94,7 +94,7 @@ fn cli_loads_project_through_directory_symlinks_and_holds_an_os_lock() {
         .open(project.join(".build/pipeline.lock"))
         .unwrap();
     lock.lock().unwrap();
-    let blocked = invoke(&linked, &["init", "au-nsw"]);
+    let blocked = invoke(&linked, &["init", "cn-jiangsu"]);
     assert!(!blocked.status.success());
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("Another OSM pipeline is running"));
     drop(lock);

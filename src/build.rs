@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 
 use crate::compute;
 use crate::format::{MAX_BLOCK, MAX_MANIFEST, canonical_json, source_metadata};
+use crate::progress::ProgressLine;
 use crate::storage::{atomic_file, atomic_write, write_object};
 
 #[derive(Clone, Debug)]
@@ -63,47 +64,50 @@ pub(crate) struct Progress {
     started: Instant,
     reported: Instant,
     count: u64,
+    output: ProgressLine,
 }
 
 impl Progress {
     pub(crate) fn new(label: &'static str) -> Self {
-        eprintln!("[osm] {label}: started");
+        let mut output = ProgressLine::default();
+        output.render(&format!("[osm] {label}: started"));
         Self {
             label,
             started: Instant::now(),
             reported: Instant::now(),
             count: 0,
+            output,
         }
     }
 
     pub(crate) fn advance(&mut self, count: u64) {
         self.count += count;
         if self.reported.elapsed() >= Duration::from_secs(2) {
-            eprintln!(
+            self.output.render(&format!(
                 "[osm] {}: {} items, {:.1}s",
                 self.label,
                 self.count,
                 self.started.elapsed().as_secs_f64()
-            );
+            ));
             self.reported = Instant::now();
         }
     }
 
-    pub(crate) fn finish(self) {
-        eprintln!(
+    pub(crate) fn finish(mut self) {
+        self.output.render(&format!(
             "[osm] {}: {} items, {:.2}s, complete",
             self.label,
             self.count,
             self.started.elapsed().as_secs_f64()
-        );
+        ));
     }
 
-    fn finish_timing(self) {
-        eprintln!(
+    fn finish_timing(mut self) {
+        self.output.render(&format!(
             "[osm] {}: {:.2}s, complete",
             self.label,
             self.started.elapsed().as_secs_f64()
-        );
+        ));
     }
 }
 

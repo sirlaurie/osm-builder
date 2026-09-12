@@ -52,29 +52,10 @@ fn lower_digit(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte.is_ascii_digit()
 }
 
-pub fn allowed_extract(extract: &str) -> bool {
-    let parts: Vec<_> = extract.split('/').collect();
-    if parts.len() < 2
-        || parts.iter().any(|part| {
-            part.is_empty() || !part.bytes().all(|byte| lower_digit(byte) || byte == b'-')
-        })
-    {
-        return false;
-    }
-    [
-        "europe/",
-        "russia/",
-        "north-america/us/",
-        "north-america/canada/",
-        "australia-oceania/australia/",
-        "asia/japan/",
-    ]
-    .iter()
-    .any(|prefix| extract.starts_with(prefix))
-        || matches!(
-            extract,
-            "asia/south-korea" | "asia/taiwan" | "africa/canary-islands"
-        )
+fn valid_extract(extract: &str) -> bool {
+    extract
+        .split('/')
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| lower_digit(byte) || byte == b'-'))
 }
 
 pub fn regions(path: &Path) -> Result<Vec<Region>> {
@@ -95,8 +76,8 @@ pub fn regions(path: &Path) -> Result<Vec<Region>> {
             "Invalid or duplicate region id"
         );
         ensure!(
-            allowed_extract(&entry.extract),
-            "Extract outside the supported regional scope: {}",
+            valid_extract(&entry.extract),
+            "Invalid extract path: {}",
             entry.extract
         );
         ensure!(
@@ -317,11 +298,8 @@ mod tests {
     }
 
     #[test]
-    fn configured_catalog_is_within_regional_capacity() {
-        let entries =
-            regions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("config/regions.json")).unwrap();
-        assert!(entries.len() > 200 && entries.len() <= 256);
-        assert!(entries.iter().any(|entry| entry.id == "au-nsw"));
+    fn configured_catalog_is_valid() {
+        regions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("config/regions.json")).unwrap();
     }
 
     #[test]
@@ -333,7 +311,7 @@ mod tests {
             serde_json::json!([{"id":"france","extract":"europe/france"},{"id":"france","extract":"europe/germany"}]),
             serde_json::json!([{"id":"france","extract":"europe/france"},{"id":"other","extract":"europe/france"}]),
             serde_json::json!([{"id":"../escape","extract":"europe/france"}]),
-            serde_json::json!([{"id":"china","extract":"asia/china"}]),
+            serde_json::json!([{"id":"china","extract":"asia/../china"}]),
         ] {
             fs::write(
                 &path,
@@ -384,7 +362,9 @@ mod tests {
     }
 
     #[test]
-    fn scope_accepts_regions_and_excludes_unsupported_sources() {
+    fn region_config_accepts_safe_extract_paths_without_a_geographic_allowlist() {
+        let work = work();
+        let path = work.path().join("regions.json");
         for extract in [
             "europe/germany/bayern",
             "russia/central-fed-district",
@@ -394,18 +374,36 @@ mod tests {
             "asia/japan/kanto",
             "asia/taiwan",
             "africa/canary-islands",
-        ] {
-            assert!(allowed_extract(extract), "{extract}");
-        }
-        for extract in [
-            "europe",
+            "asia/china/jiangsu",
             "asia/china",
+            "south-america/brazil",
+            "africa/kenya",
             "north-america/us",
             "asia/japan",
+            "europe",
+        ] {
+            fs::write(
+                &path,
+                serde_json::to_vec(
+                    &serde_json::json!({"regions":[{"id":"configured-region","extract":extract}]}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let entries = regions(&path).unwrap_or_else(|error| panic!("{extract}: {error}"));
+            assert_eq!(entries[0].extract, extract);
+        }
+        for extract in [
+            "",
+            "/europe/france",
+            "europe/france/",
+            "europe//france",
             "europe/../asia",
             "europe/France",
+            "europe/france?query=1",
+            "https://example.com/europe/france",
         ] {
-            assert!(!allowed_extract(extract), "{extract}");
+            assert!(!valid_extract(extract), "{extract}");
         }
     }
 

@@ -1,5 +1,6 @@
 use crate::config::{Environment, Runtime};
 use crate::format::{self, Current, MAX_BLOCK, MAX_CURRENT, MAX_MANIFEST, Release};
+use crate::progress::ProgressLine;
 use crate::storage::{atomic_write, read_local};
 use anyhow::{Result, anyhow, bail, ensure};
 use aws_credential_types::Credentials;
@@ -13,7 +14,7 @@ use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::io::{IsTerminal, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
@@ -646,33 +647,32 @@ struct ReporterState {
     started: Instant,
     last_write: Option<Instant>,
     latest: Option<Progress>,
-    terminal: bool,
-    columns: Option<usize>,
-    rows: usize,
     closed: bool,
-    output: Box<dyn Write + Send>,
+    output: ProgressLine,
 }
 
 impl Default for ProgressReporter {
     fn default() -> Self {
-        Self::with_output(
-            Box::new(std::io::stderr()),
-            std::io::stderr().is_terminal(),
-            None,
-        )
+        Self::with_line(ProgressLine::default())
     }
 }
 
 impl ProgressReporter {
-    fn with_output(output: Box<dyn Write + Send>, terminal: bool, columns: Option<usize>) -> Self {
+    #[cfg(test)]
+    fn with_output(
+        output: Box<dyn std::io::Write + Send>,
+        terminal: bool,
+        columns: Option<usize>,
+    ) -> Self {
+        Self::with_line(ProgressLine::with_output(output, terminal, columns))
+    }
+
+    fn with_line(output: ProgressLine) -> Self {
         let shared = Arc::new((
             Mutex::new(ReporterState {
                 started: Instant::now(),
                 last_write: None,
                 latest: None,
-                terminal,
-                columns,
-                rows: 1,
                 closed: false,
                 output,
             }),
@@ -716,9 +716,6 @@ impl Drop for ProgressReporter {
         {
             let mut state = self.shared.0.lock().expect("progress lock");
             state.closed = true;
-            if state.terminal && state.latest.is_some() {
-                let _ = writeln!(state.output);
-            }
         }
         self.shared.1.notify_one();
         if let Some(worker) = self.worker.take() {
@@ -732,7 +729,7 @@ impl ReporterState {
         let Some(progress) = &self.latest else {
             return;
         };
-        let interval = Duration::from_secs(if self.terminal { 1 } else { 5 });
+        let interval = Duration::from_secs(if self.output.is_terminal() { 1 } else { 5 });
         if !force
             && self
                 .last_write
@@ -772,30 +769,14 @@ impl ReporterState {
             line.push_str(&format!(" | attempt {attempt}/{maximum}"));
         }
         line.push_str(&format!(" | {}s elapsed", self.started.elapsed().as_secs()));
-        if self.terminal {
-            if self.rows > 1 {
-                let _ = write!(self.output, "\x1b[{}A", self.rows - 1);
-            }
-            let _ = write!(self.output, "\r\x1b[0J{line}");
-            let _ = self.output.flush();
-            let columns = self
-                .columns
-                .or_else(|| {
-                    terminal_size::terminal_size_of(std::io::stderr())
-                        .map(|(width, _)| usize::from(width.0))
-                })
-                .filter(|columns| *columns > 0)
-                .unwrap_or(80);
-            self.rows = line.len().div_ceil(columns);
-        } else {
-            let _ = writeln!(self.output, "{line}");
-        }
+        self.output.render(&line);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[derive(Clone)]
     struct Output(Arc<Mutex<Vec<u8>>>);
