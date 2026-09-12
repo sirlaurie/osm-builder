@@ -1,0 +1,10 @@
+.build/
+target/
+.env*
+*.pbf
+*.osm
+*.opl
+*.sqlite*
+*.db*
+*.log
+*.pem

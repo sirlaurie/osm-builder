@@ -1,0 +1,49 @@
+[package]
+name = "aura-osm"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[[bin]]
+name = "osm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+aws-credential-types = { version = "1", default-features = false }
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+fs2 = "0.4"
+libc = "0.2"
+md-5 = "0.10"
+osmpbfreader = "0.19.1"
+plist = "1"
+protobuf = "3"
+quick-xml = { version = "0.42", features = ["encoding"] }
+rayon = "1"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+tempfile = "3"
+terminal_size = "0.4"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.40", features = ["hooks"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,5 @@
+[build]
+target-dir = ".build/tools/rust"
+
+[env]
+SQLITE_TMPDIR = { value = ".build/tools/tmp", relative = true }
