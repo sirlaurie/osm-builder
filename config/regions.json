@@ -26,6 +26,7 @@
     {"id":"ca-quebec","extract":"north-america/canada/quebec"},
     {"id":"ca-saskatchewan","extract":"north-america/canada/saskatchewan"},
     {"id":"ca-yukon","extract":"north-america/canada/yukon"},
+    {"id":"cn-jiangsu","extract":"asia/china/jiangsu"},
     {"id":"eu-albania","extract":"europe/albania"},
     {"id":"eu-andorra","extract":"europe/andorra"},
     {"id":"eu-austria","extract":"europe/austria"},
