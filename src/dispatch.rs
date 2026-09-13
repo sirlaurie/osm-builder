@@ -29,6 +29,7 @@ pub struct Lease {
     pub region: String,
     pub extract: String,
     pub device_id: String,
+    pub slot: u8,
     pub token: String,
     pub generation: u64,
     pub expires_at: String,
@@ -44,6 +45,13 @@ pub struct Claim {
     pub running: usize,
     pub failed: usize,
     pub retry_after_seconds: u64,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseOutcome {
+    Failed,
+    Retry,
 }
 
 fn valid_uuid(value: &str) -> bool {
@@ -90,6 +98,7 @@ impl Lease {
                 && format::is_region(&self.region)
                 && valid_extract(&self.extract)
                 && valid_uuid(&self.device_id)
+                && self.slot <= 1
                 && valid_uuid(&self.token)
                 && (1..=format::MAX_ID).contains(&self.generation)
                 && (1..=60).contains(&self.renew_after_seconds),
@@ -103,6 +112,7 @@ impl Lease {
             && self.region == other.region
             && self.extract == other.extract
             && self.device_id == other.device_id
+            && self.slot == other.slot
             && self.token == other.token
             && self.generation == other.generation
     }
@@ -237,9 +247,10 @@ impl Client {
             .ok_or_else(|| anyhow!("Invalid dispatch batch response"))
     }
 
-    pub fn claim(&self, device_id: &str, local_regions: &[String]) -> Result<Claim> {
+    pub fn claim(&self, device_id: &str, local_regions: &[String], slot: u8) -> Result<Claim> {
         ensure!(
             valid_uuid(device_id)
+                && slot <= 1
                 && local_regions.len() <= 256
                 && local_regions.iter().all(|region| format::is_region(region)),
             "Invalid dispatch claim"
@@ -248,7 +259,7 @@ impl Client {
             Method::POST,
             "/admin/jobs/claim",
             Some(&json!({
-                "requestId": uuid()?, "deviceId": device_id, "localRegions": local_regions,
+                "requestId": uuid()?, "deviceId": device_id, "localRegions": local_regions, "slot": slot,
             })),
         )?;
         let claim: Claim = serde_json::from_value(value)
@@ -268,7 +279,9 @@ impl Client {
         if let Some(lease) = &claim.lease {
             lease.validate()?;
             ensure!(
-                claim.batch_id.as_ref() == Some(&lease.batch_id) && lease.device_id == device_id,
+                claim.batch_id.as_ref() == Some(&lease.batch_id)
+                    && lease.device_id == device_id
+                    && lease.slot == slot,
                 "Dispatch claim returned a different owner"
             );
         }
@@ -297,11 +310,12 @@ impl Client {
         Ok(renewed)
     }
 
-    pub fn release(&self, lease: &Lease) -> Result<()> {
+    pub fn release(&self, lease: &Lease, outcome: ReleaseOutcome) -> Result<()> {
+        lease.validate()?;
         let value = self.request(
             Method::POST,
             "/admin/jobs/release",
-            Some(&json!({ "lease": lease })),
+            Some(&json!({ "lease": lease, "outcome": outcome })),
         )?;
         ensure!(
             value["success"] == true,

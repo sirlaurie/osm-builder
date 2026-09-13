@@ -196,7 +196,7 @@ fn rust_init_publish_query_update_reuse_cleanup_preserves_cloud_data() {
         .start("bootstrap", std::slice::from_ref(&entry))
         .unwrap();
     let device = aura_osm::dispatch::device_id(&data).unwrap();
-    let first_lease = dispatch.claim(&device, &[]).unwrap().lease.unwrap();
+    let first_lease = dispatch.claim(&device, &[], 0).unwrap().lease.unwrap();
     let first = publisher
         .publish(&output, &first_lease, |event| {
             if event.stage == "publish" {
@@ -258,7 +258,8 @@ fn rust_init_publish_query_update_reuse_cleanup_preserves_cloud_data() {
     dispatch
         .start("update", std::slice::from_ref(&entry))
         .unwrap();
-    let update_lease = dispatch.claim(&device, &[]).unwrap().lease.unwrap();
+    let update_lease = dispatch.claim(&device, &[], 1).unwrap().lease.unwrap();
+    assert_eq!(update_lease.slot, 1);
     let uploaded = publisher
         .publish(&updated_output, &update_lease, |_| {})
         .unwrap();

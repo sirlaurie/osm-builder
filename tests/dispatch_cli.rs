@@ -194,11 +194,19 @@ fn work_once_exits_for_terminal_batches_and_reports_failed_regions() {
             assert!(stderr.contains("Batch has 2 failed regions"), "{stderr}");
         }
         let requests = server.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0].body;
-        assert_eq!(request["deviceId"].as_str().unwrap().len(), 36);
-        assert_eq!(request["requestId"].as_str().unwrap().len(), 36);
-        assert_eq!(request["localRegions"], json!([]));
+        assert!((1..=2).contains(&requests.len()));
+        if failed == 0 {
+            assert_eq!(requests.len(), 2);
+        }
+        let mut slots = std::collections::HashSet::new();
+        for request in requests.iter().map(|request| &request.body) {
+            assert_eq!(request["deviceId"].as_str().unwrap().len(), 36);
+            assert_eq!(request["deviceId"], requests[0].body["deviceId"]);
+            assert_eq!(request["requestId"].as_str().unwrap().len(), 36);
+            assert_eq!(request["localRegions"], json!([]));
+            let slot = request["slot"].as_u64().unwrap();
+            assert!(slot <= 1 && slots.insert(slot));
+        }
     }
 }
 

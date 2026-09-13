@@ -262,17 +262,17 @@ fn run(cli: Cli) -> Result<()> {
             let client = publisher.coordinator();
             client.start("update", std::slice::from_ref(&entry))?;
             let device = dispatch::device_id(&runtime.data_dir)?;
-            let lease = client.claim(&device, &[entry.id])?.lease.context(
+            let lease = client.claim(&device, &[entry.id], 0)?.lease.context(
                 "Publication task is already claimed; use osm jobs to inspect its owner",
             )?;
             let guard = dispatch::Guard::start(client.clone(), lease.clone())?;
-            let mut progress = ProgressReporter::default();
+            let mut progress = ProgressReporter::for_region(&lease.region);
             let result =
                 publisher.publish(&directory, &guard.lease()?, |event| progress.update(event));
             drop(progress);
             drop(guard);
             if result.is_err() {
-                let _ = client.release(&lease);
+                let _ = client.release(&lease, dispatch::ReleaseOutcome::Failed);
             }
             print_json(&result?)?;
         }

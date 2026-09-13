@@ -4,8 +4,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     time::Duration,
@@ -47,11 +47,32 @@ struct Downloader {
 #[derive(Default)]
 struct DownloadControl {
     cancelled: AtomicBool,
+    failed: AtomicBool,
     foreground: AtomicBool,
     changed: tokio::sync::Notify,
+    pipeline: Option<(Arc<PipelineFlow>, usize)>,
 }
 
 impl DownloadControl {
+    fn download_turn(&self) -> Result<()> {
+        if let Some((flow, slot)) = &self.pipeline {
+            while !self.foreground.load(Ordering::Acquire)
+                && !flow.sources_ready.lock().expect("source readiness lock")[1 - slot]
+            {
+                ensure!(
+                    !self.cancelled.load(Ordering::Acquire),
+                    "Prefetch cancelled"
+                );
+                flow.wait(Duration::from_millis(20));
+            }
+        }
+        ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "Prefetch cancelled"
+        );
+        Ok(())
+    }
+
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.changed.notify_one();
@@ -180,19 +201,22 @@ impl Downloader {
             return Ok(Duration::ZERO);
         };
         let started = std::time::Instant::now();
-        let reserve = runtime
-            .start_free_gib
-            .max(runtime.min_free_gib)
-            .checked_mul(1024 * 1024 * 1024)
-            .context("Disk reserve overflow")?;
-        let needed = reserve
-            .checked_add(remaining)
-            .context("Download disk budget overflow")?;
         let mut paused = false;
         loop {
             self.check_cancelled()?;
+            let foreground = control.foreground.load(Ordering::Acquire);
+            let reserve = if foreground {
+                runtime.min_free_gib
+            } else {
+                runtime.start_free_gib.max(runtime.min_free_gib)
+            }
+            .checked_mul(1024 * 1024 * 1024)
+            .context("Disk reserve overflow")?;
+            let needed = reserve
+                .checked_add(remaining)
+                .context("Download disk budget overflow")?;
             let available = fs2::available_space(path)?;
-            if control.foreground.load(Ordering::Acquire) || available >= needed {
+            if available >= needed {
                 if paused {
                     progress::message(&format!(
                         "Prefetch resumed at {}: {} GiB free",
@@ -201,6 +225,17 @@ impl Downloader {
                     ));
                 }
                 return Ok(started.elapsed());
+            }
+            if foreground {
+                ensure!(
+                    control
+                        .pipeline
+                        .as_ref()
+                        .is_some_and(|(flow, slot)| flow.can_reclaim(*slot)),
+                    "Insufficient space for download and {} GiB reserve at {}",
+                    runtime.min_free_gib,
+                    path.display()
+                );
             }
             if !paused {
                 progress::message(&format!(
@@ -378,7 +413,22 @@ struct Prefetch {
 
 impl Prefetch {
     fn start(runtime: &Runtime, entry: &Region, catalog: &Path, data: &Path) -> Self {
-        let control = Arc::new(DownloadControl::default());
+        Self::controlled(
+            runtime,
+            entry,
+            catalog,
+            data,
+            Arc::new(DownloadControl::default()),
+        )
+    }
+
+    fn controlled(
+        runtime: &Runtime,
+        entry: &Region,
+        catalog: &Path,
+        data: &Path,
+        control: Arc<DownloadControl>,
+    ) -> Self {
         let thread_control = Arc::clone(&control);
         let runtime = runtime.clone();
         let entry = entry.clone();
@@ -388,15 +438,37 @@ impl Prefetch {
         let result = std::thread::Builder::new()
             .name(format!("prefetch-{region}"))
             .spawn(move || {
-                fs::create_dir_all(&downloads)?;
-                let job = tempfile::Builder::new()
-                    .prefix(&format!("{}-", entry.id))
-                    .rand_bytes(10)
-                    .tempdir_in(downloads)?;
-                let mut downloader = Downloader::new(&runtime)?;
-                downloader.control = Some(thread_control);
-                downloader.source_snapshot(&runtime, &entry, &catalog, job.path())?;
-                Ok(job)
+                let _label = progress::region(&entry.id);
+                let result = (|| -> Result<tempfile::TempDir> {
+                    let pipeline = thread_control.pipeline.clone();
+                    thread_control.download_turn()?;
+                    let _download = pipeline
+                        .as_ref()
+                        .map(|(flow, _)| flow.download.lock().expect("download lock"));
+                    fs::create_dir_all(&downloads)?;
+                    let job = tempfile::Builder::new()
+                        .prefix(&format!("{}-", entry.id))
+                        .rand_bytes(10)
+                        .tempdir_in(downloads)?;
+                    let mut downloader = Downloader::new(&runtime)?;
+                    downloader.control = Some(Arc::clone(&thread_control));
+                    downloader.source_snapshot(&runtime, &entry, &catalog, job.path())?;
+                    if let Some((flow, slot)) = pipeline.as_ref() {
+                        flow.sources_ready.lock().expect("source readiness lock")[*slot] = true;
+                        flow.changed.notify_all();
+                    }
+                    Ok(job)
+                })();
+                if let Err(error) = &result
+                    && !thread_control.cancelled.load(Ordering::Acquire)
+                    && let Some((flow, _)) = &thread_control.pipeline
+                {
+                    thread_control.failed.store(true, Ordering::Release);
+                    *flow.failure.lock().expect("pipeline failure lock") =
+                        Some(format!("Region {} prefetch failed: {error:#}", entry.id));
+                    flow.stop();
+                }
+                result
             });
         let (task, error) = match result {
             Ok(task) => (Some(task), None),
@@ -494,10 +566,10 @@ impl Operations<'_> {
             "Downloaded job does not match the configured regional source"
         );
         let pbf = job.join("source.osm.pbf");
-        println!(
+        progress::message(&format!(
             "[{}] Checking complete source and replication header",
             entry.id
-        );
+        ));
         let metadata = source::stamp(&pbf, &job.join("source.md5"), &entry.updates_url())?;
         let work = tempfile::Builder::new().prefix("init-").tempdir_in(data)?;
         let anchor = self.downloader.remote_state(
@@ -512,11 +584,12 @@ impl Operations<'_> {
         );
         let candidate = work.path().join("index");
         self.check_disks(data, self.runtime.min_free_gib)?;
+        self.downloader.check_cancelled()?;
         self.start_prefetch(next, data);
-        println!(
+        progress::message(&format!(
             "[{}] Building persistent object index from the complete source",
             entry.id
-        );
+        ));
         incremental::initialize(
             &incremental::InitOptions {
                 input: pbf,
@@ -534,12 +607,12 @@ impl Operations<'_> {
         fs::rename(&candidate, &state)?;
         sync_directory(data)?;
         let current = status(entry, data, self.runtime)?;
-        println!(
+        progress::message(&format!(
             "[{}] Index ready at sequence {}: {}",
             entry.id,
             sequence(&current)?,
             string(&current, "output")?
-        );
+        ));
         Ok(current)
     }
 
@@ -577,11 +650,15 @@ impl Operations<'_> {
             pending != 0 || string(&current, "coverageSHA256")? == coverage_hash,
             "Catalog coverage changed without a new regional replication sequence; wait for the next extract"
         );
-        println!(
+        progress::message(&format!(
             "[{}] {pending} daily changes: {} → {}",
             entry.id, anchor.sequence, latest.sequence
-        );
+        ));
         for number in anchor.sequence + 1..=latest.sequence {
+            self.downloader.check_cancelled()?;
+            if let Some(guard) = self.lease {
+                guard.lease()?;
+            }
             self.check_disks(data, self.runtime.min_free_gib)?;
             let next =
                 self.downloader
@@ -612,10 +689,10 @@ impl Operations<'_> {
                 },
                 &self.runtime.compute_options(),
             )?;
-            println!(
+            progress::message(&format!(
                 "[{}] Applied sequence {number}/{}",
                 entry.id, latest.sequence
-            );
+            ));
         }
         Ok(current)
     }
@@ -786,7 +863,10 @@ pub fn resume_cleanup(entry: &Region, data: &Path, manifest: &str) -> Result<()>
     }
     fs::remove_file(marker)?;
     sync_directory(data)?;
-    println!("[{}] Published data removed from local disk", entry.id);
+    progress::message(&format!(
+        "[{}] Published data removed from local disk",
+        entry.id
+    ));
     Ok(())
 }
 
@@ -945,6 +1025,514 @@ pub fn submit(
         .start(mode, &entries)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkPhase {
+    Idle,
+    Preparing,
+    Computing,
+    Uploading,
+}
+
+struct PipelineFlow {
+    cancelled: Arc<AtomicBool>,
+    phases: Mutex<[WorkPhase; 2]>,
+    sources_ready: Mutex<[bool; 2]>,
+    changed: Condvar,
+    claims: Mutex<()>,
+    issued: AtomicUsize,
+    compute: Mutex<usize>,
+    compute_changed: Condvar,
+    upload: Mutex<()>,
+    download: Mutex<()>,
+    controls: Mutex<Vec<Weak<DownloadControl>>>,
+    failure: Mutex<Option<String>>,
+    cleanup: bool,
+}
+
+impl PipelineFlow {
+    fn new(cleanup: bool) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            phases: Mutex::new([WorkPhase::Idle; 2]),
+            sources_ready: Mutex::new([false; 2]),
+            changed: Condvar::new(),
+            claims: Mutex::new(()),
+            issued: AtomicUsize::new(0),
+            compute: Mutex::new(0),
+            compute_changed: Condvar::new(),
+            upload: Mutex::new(()),
+            download: Mutex::new(()),
+            controls: Mutex::new(Vec::new()),
+            failure: Mutex::new(None),
+            cleanup,
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "Pipeline stopped after a regional failure"
+        );
+        Ok(())
+    }
+
+    fn stop(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        for control in self
+            .controls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            control.cancel();
+        }
+        let _phases = self
+            .phases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.changed.notify_all();
+        let _compute = self
+            .compute
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.compute_changed.notify_all();
+    }
+
+    fn phase(&self, slot: usize, phase: WorkPhase) {
+        if phase == WorkPhase::Preparing {
+            self.sources_ready.lock().expect("source readiness lock")[slot] = false;
+        }
+        self.phases.lock().expect("pipeline phases lock")[slot] = phase;
+        self.changed.notify_all();
+    }
+
+    fn can_reclaim(&self, slot: usize) -> bool {
+        self.cleanup
+            && self.phases.lock().expect("pipeline phases lock")[1 - slot] == WorkPhase::Uploading
+    }
+
+    fn control(self: &Arc<Self>, slot: usize) -> Arc<DownloadControl> {
+        let control = Arc::new(DownloadControl {
+            pipeline: Some((Arc::clone(self), slot)),
+            ..DownloadControl::default()
+        });
+        let mut controls = self.controls.lock().expect("download controls lock");
+        controls.retain(|control| control.strong_count() != 0);
+        controls.push(Arc::downgrade(&control));
+        if self.cancelled.load(Ordering::Acquire) {
+            control.cancel();
+        }
+        control
+    }
+
+    fn wait(&self, duration: Duration) {
+        let phases = self.phases.lock().expect("pipeline phases lock");
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self
+            .changed
+            .wait_timeout(phases, duration)
+            .expect("pipeline wait");
+    }
+
+    fn compute_turn(&self, ticket: usize) -> Result<ComputeTurn<'_>> {
+        let mut next = self.compute.lock().expect("compute order lock");
+        loop {
+            self.check()?;
+            if *next == ticket {
+                return Ok(ComputeTurn(self));
+            }
+            next = self.compute_changed.wait(next).expect("compute order wait");
+        }
+    }
+}
+
+struct ComputeTurn<'a>(&'a PipelineFlow);
+
+impl Drop for ComputeTurn<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .compute
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) += 1;
+        self.0.compute_changed.notify_all();
+    }
+}
+
+enum WorkClaim<T> {
+    Task(T),
+    Idle {
+        done: bool,
+        failed: usize,
+        retry: Duration,
+    },
+}
+
+struct StopOnPanic<'a>(&'a PipelineFlow);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.stop();
+        }
+    }
+}
+
+trait WorkOperations: Sync {
+    type Task: Send;
+    type Output;
+
+    fn claim(&self, slot: u8) -> Result<WorkClaim<Self::Task>>;
+    fn region<'a>(&self, task: &'a Self::Task) -> &'a str;
+    fn prepare(&self, task: &mut Self::Task, flow: &Arc<PipelineFlow>, slot: usize) -> Result<()>;
+    fn ready(&self, task: &Self::Task) -> Result<()>;
+    fn compute(
+        &self,
+        task: &mut Self::Task,
+        flow: &Arc<PipelineFlow>,
+        slot: usize,
+    ) -> Result<Self::Output>;
+    fn publish(
+        &self,
+        task: &Self::Task,
+        output: &Self::Output,
+        cancelled: &AtomicBool,
+    ) -> Result<()>;
+    fn cleanup(&self, task: &Self::Task, output: &Self::Output) -> Result<()>;
+    fn release(&self, task: &mut Self::Task, outcome: dispatch::ReleaseOutcome) -> Result<()>;
+    fn failed(&self, _task: &Self::Task) -> bool {
+        false
+    }
+}
+
+fn execute_work(operations: &impl WorkOperations, once: bool, cleanup: bool) -> Result<()> {
+    let flow = Arc::new(PipelineFlow::new(cleanup));
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for slot in 0..2 {
+            let flow = Arc::clone(&flow);
+            workers.push(scope.spawn(move || -> Result<()> {
+                let _stop_on_panic = StopOnPanic(&flow);
+                loop {
+                    let (claim, ticket) = {
+                        let _claim = flow.claims.lock().expect("claim lock");
+                        if flow.check().is_err() {
+                            return Ok(());
+                        }
+                        match operations.claim(slot as u8) {
+                            Ok(claim) => {
+                                let ticket = if matches!(&claim, WorkClaim::Task(_)) {
+                                    Some(flow.issued.fetch_add(1, Ordering::Relaxed))
+                                } else { None };
+                                (claim, ticket)
+                            },
+                            Err(error) => {
+                                flow.stop();
+                                return Err(error);
+                            }
+                        }
+                    };
+                    let mut task = match claim {
+                        WorkClaim::Task(task) => task,
+                        WorkClaim::Idle { done, failed, retry } => {
+                            if once && done {
+                                if failed != 0 {
+                                    flow.stop();
+                                    bail!("Batch has {failed} failed regions; inspect osm jobs and submit a retry batch");
+                                }
+                                return Ok(());
+                            }
+                            flow.wait(retry);
+                            continue;
+                        }
+                    };
+                    let region = operations.region(&task).to_owned();
+                    let _label = progress::region(&region);
+                    flow.phase(slot, WorkPhase::Preparing);
+                    let result = (|| -> Result<()> {
+                        flow.check()?;
+                        operations.prepare(&mut task, &flow, slot)?;
+                        let output = {
+                            let _compute = flow.compute_turn(ticket.expect("Claimed task has a compute ticket"))?;
+                            let mut waiting = false;
+                            loop {
+                                flow.check()?;
+                                match operations.ready(&task) {
+                                    Ok(()) => break,
+                                    Err(error) if flow.can_reclaim(slot) => {
+                                        if !waiting {
+                                            progress::message(&format!("Waiting for publication cleanup: {error}"));
+                                            waiting = true;
+                                        }
+                                        flow.wait(Duration::from_secs(1));
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            flow.phase(slot, WorkPhase::Computing);
+                            let output = operations.compute(&mut task, &flow, slot)?;
+                            flow.phase(slot, WorkPhase::Uploading);
+                            output
+                        };
+                        let _upload = flow.upload.lock().expect("upload lock");
+                        flow.check()?;
+                        operations.publish(&task, &output, &flow.cancelled)?;
+                        if cleanup {
+                            operations.cleanup(&task, &output)?;
+                        }
+                        progress::message("Published");
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        let outcome = if flow.cancelled.load(Ordering::Acquire) && !operations.failed(&task) {
+                            dispatch::ReleaseOutcome::Retry
+                        } else {
+                            dispatch::ReleaseOutcome::Failed
+                        };
+                        flow.stop();
+                        if let Err(release_error) = operations.release(&mut task, outcome) {
+                            progress::message(&format!("Could not release task: {release_error:#}"));
+                        }
+                        return Err(error.context(format!("Region {region} failed")));
+                    }
+                    flow.phase(slot, WorkPhase::Idle);
+                }
+            }));
+        }
+        let mut errors = Vec::new();
+        for worker in workers {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!("{error:#}")),
+                Err(_) => {
+                    flow.stop();
+                    errors.push("Regional worker panicked".into());
+                }
+            }
+        }
+        if let Some(failure) = flow.failure.lock().expect("pipeline failure lock").take() {
+            errors.insert(0, failure);
+        }
+        ensure!(errors.is_empty(), "{}", errors.join("; "));
+        Ok(())
+    })
+}
+
+struct ClaimedRegion {
+    lease: dispatch::Lease,
+    prefetch: Option<Prefetch>,
+    download_control: Option<Arc<DownloadControl>>,
+    catalog: Option<tempfile::TempDir>,
+    guard: Option<dispatch::Guard>,
+}
+
+struct CloudWork<'a> {
+    runtime: &'a Runtime,
+    environment: &'a Environment,
+    scratch: PathBuf,
+    device: String,
+    publisher: Publisher,
+    client: dispatch::Client,
+    cleanup: bool,
+}
+
+impl WorkOperations for CloudWork<'_> {
+    type Task = ClaimedRegion;
+    type Output = Value;
+
+    fn claim(&self, slot: u8) -> Result<WorkClaim<Self::Task>> {
+        let local_regions = fs::read_dir(&self.runtime.data_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                (format::is_region(&name) && entry.path().join("state.sqlite").is_file())
+                    .then_some(name)
+            })
+            .collect::<Vec<_>>();
+        let claim = self.client.claim(&self.device, &local_regions, slot)?;
+        Ok(match claim.lease {
+            Some(lease) => WorkClaim::Task(ClaimedRegion {
+                lease,
+                guard: None,
+                catalog: None,
+                prefetch: None,
+                download_control: None,
+            }),
+            None => WorkClaim::Idle {
+                done: claim.pending == 0 && claim.running == 0,
+                failed: claim.failed,
+                retry: Duration::from_secs(claim.retry_after_seconds.clamp(1, 60)),
+            },
+        })
+    }
+
+    fn region<'a>(&self, task: &'a Self::Task) -> &'a str {
+        &task.lease.region
+    }
+
+    fn prepare(&self, task: &mut Self::Task, flow: &Arc<PipelineFlow>, slot: usize) -> Result<()> {
+        task.guard = Some(dispatch::Guard::start(
+            self.client.clone(),
+            task.lease.clone(),
+        )?);
+        let entry = Region {
+            id: task.lease.region.clone(),
+            extract: task.lease.extract.clone(),
+        };
+        progress::message(&format!("Claimed generation {}", task.lease.generation));
+        let data = &self.runtime.data_dir;
+        let marker = data.join(format!(".cleanup-{}.json", entry.id));
+        if marker.try_exists()? || is_symlink(&marker)? {
+            ensure!(
+                self.cleanup,
+                "Region cleanup is incomplete; resume work with --cleanup"
+            );
+            let published = self
+                .publisher
+                .read_state()?
+                .context("Cleanup record has no published state")?;
+            let manifest = &published
+                .regions
+                .iter()
+                .find(|region| region.region == entry.id)
+                .context("Cleanup record has no published region")?
+                .manifest;
+            resume_cleanup(&entry, data, manifest)?;
+        }
+        let catalog = tempfile::Builder::new()
+            .prefix("catalog-")
+            .tempdir_in(&self.scratch)?;
+        let mut downloader = Downloader::new(self.runtime)?;
+        let control = flow.control(slot);
+        control.consume();
+        downloader.control = Some(control);
+        downloader.download(
+            self.runtime,
+            INDEX_URL,
+            &catalog.path().join("index.json"),
+            Some(64 * 1024 * 1024),
+        )?;
+        flow.check()?;
+        if !data.join(&entry.id).try_exists()? {
+            let control = flow.control(slot);
+            task.prefetch = Some(Prefetch::controlled(
+                self.runtime,
+                &entry,
+                &catalog.path().join("index.json"),
+                data,
+                Arc::clone(&control),
+            ));
+            task.download_control = Some(control);
+        } else {
+            flow.sources_ready.lock().expect("source readiness lock")[slot] = true;
+        }
+        task.catalog = Some(catalog);
+        Ok(())
+    }
+
+    fn ready(&self, task: &Self::Task) -> Result<()> {
+        let minimum = if self
+            .runtime
+            .data_dir
+            .join(&task.lease.region)
+            .try_exists()?
+        {
+            self.runtime.min_free_gib
+        } else {
+            self.runtime.start_free_gib.max(self.runtime.min_free_gib)
+        };
+        disk_check(&self.runtime.data_dir, minimum)?;
+        disk_check(&self.scratch, minimum)
+    }
+
+    fn compute(
+        &self,
+        task: &mut Self::Task,
+        flow: &Arc<PipelineFlow>,
+        slot: usize,
+    ) -> Result<Value> {
+        let guard = task
+            .guard
+            .as_ref()
+            .context("Missing regional lease guard")?;
+        let entry = Region {
+            id: task.lease.region.clone(),
+            extract: task.lease.extract.clone(),
+        };
+        let mut downloader = Downloader::new(self.runtime)?;
+        let control = flow.control(slot);
+        control.consume();
+        downloader.control = Some(control);
+        let mut operations = Operations {
+            runtime: self.runtime,
+            environment: self.environment,
+            scratch: &self.scratch,
+            downloader,
+            catalog: task
+                .catalog
+                .as_ref()
+                .context("Missing regional catalog")?
+                .path()
+                .join("index.json"),
+            publisher: None,
+            lease: Some(guard),
+            prefetch: task.prefetch.take(),
+        };
+        guard.lease()?;
+        if !self.runtime.data_dir.join(&entry.id).try_exists()? {
+            operations.initialize(&entry, &self.runtime.data_dir, None, None)?;
+        }
+        flow.check()?;
+        guard.lease()?;
+        operations.update(&entry, &self.runtime.data_dir)
+    }
+
+    fn publish(&self, task: &Self::Task, output: &Value, cancelled: &AtomicBool) -> Result<()> {
+        let lease = task
+            .guard
+            .as_ref()
+            .context("Missing regional lease guard")?
+            .lease()?;
+        let mut reporter = ProgressReporter::default();
+        self.publisher.publish_with_cancel(
+            Path::new(string(output, "output")?),
+            &lease,
+            cancelled,
+            |event| reporter.update(event),
+        )?;
+        Ok(())
+    }
+
+    fn cleanup(&self, task: &Self::Task, output: &Value) -> Result<()> {
+        cleanup_region(
+            &Region {
+                id: task.lease.region.clone(),
+                extract: task.lease.extract.clone(),
+            },
+            &self.runtime.data_dir,
+            string(output, "manifest")?,
+        )
+    }
+
+    fn release(&self, task: &mut Self::Task, outcome: dispatch::ReleaseOutcome) -> Result<()> {
+        task.prefetch = None;
+        self.client.release(&task.lease, outcome)
+    }
+
+    fn failed(&self, task: &Self::Task) -> bool {
+        task.download_control
+            .as_ref()
+            .is_some_and(|control| control.failed.load(Ordering::Acquire))
+            || task
+                .guard
+                .as_ref()
+                .is_some_and(|guard| guard.lease().is_err())
+    }
+}
+
 pub fn work(
     root: &Path,
     runtime: &Runtime,
@@ -960,92 +1548,19 @@ pub fn work(
     let scratch = root.join(".build/tools/tmp");
     fs::create_dir_all(&scratch)?;
     println!("Device {device}: waiting for regional tasks");
-    let mut failures = 0;
-    loop {
-        let local_regions = fs::read_dir(data)?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let name = entry.file_name().into_string().ok()?;
-                (format::is_region(&name) && entry.path().join("state.sqlite").is_file())
-                    .then_some(name)
-            })
-            .collect::<Vec<_>>();
-        let claim = client.claim(&device, &local_regions)?;
-        let Some(lease) = claim.lease else {
-            if once && claim.pending == 0 && claim.running == 0 {
-                ensure!(
-                    claim.failed == 0 && failures == 0,
-                    "Batch has {} failed regions and {failures} local failures; inspect osm jobs and submit a retry batch",
-                    claim.failed
-                );
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_secs(claim.retry_after_seconds.clamp(1, 60)));
-            continue;
-        };
-        let entry = Region {
-            id: lease.region.clone(),
-            extract: lease.extract.clone(),
-        };
-        println!("[{}] Claimed generation {}", entry.id, lease.generation);
-        let guard = dispatch::Guard::start(client.clone(), lease.clone())?;
-        let result = (|| -> Result<()> {
-            let catalog = tempfile::Builder::new()
-                .prefix("catalog-")
-                .tempdir_in(&scratch)?;
-            let mut operations = Operations {
-                runtime,
-                environment,
-                scratch: &scratch,
-                downloader: Downloader::new(runtime)?,
-                catalog: catalog.path().join("index.json"),
-                publisher: None,
-                lease: Some(&guard),
-                prefetch: None,
-            };
-            let marker = data.join(format!(".cleanup-{}.json", entry.id));
-            if marker.try_exists()? || is_symlink(&marker)? {
-                ensure!(
-                    cleanup,
-                    "Region cleanup is incomplete; resume work with --cleanup"
-                );
-                let published = operations.published_regions()?;
-                resume_cleanup(
-                    &entry,
-                    data,
-                    published
-                        .get(&entry.id)
-                        .context("Cleanup record has no published region")?,
-                )?;
-            }
-            operations.downloader.download(
-                runtime,
-                INDEX_URL,
-                &operations.catalog,
-                Some(64 * 1024 * 1024),
-            )?;
-            guard.lease()?;
-            if !data.join(&entry.id).try_exists()? {
-                operations.initialize(&entry, data, None, None)?;
-            }
-            guard.lease()?;
-            let current = operations.update(&entry, data)?;
-            operations.publish(Path::new(string(&current, "output")?))?;
-            if cleanup {
-                cleanup_region(&entry, data, string(&current, "manifest")?)?;
-            }
-            println!("[{}] Published", entry.id);
-            Ok(())
-        })();
-        drop(guard);
-        if let Err(error) = result {
-            failures += 1;
-            eprintln!("[{}] Failed: {error:#}", entry.id);
-            if let Err(release_error) = client.release(&lease) {
-                eprintln!("[{}] Could not release task: {release_error:#}", entry.id);
-            }
-        }
-    }
+    execute_work(
+        &CloudWork {
+            runtime,
+            environment,
+            scratch,
+            device,
+            publisher,
+            client,
+            cleanup,
+        },
+        once,
+        cleanup,
+    )
 }
 
 pub fn build(
@@ -1234,6 +1749,380 @@ mod tests {
             &Environment::default(),
         )
         .unwrap()
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ScheduleCase {
+        Overlap,
+        LowDisk,
+        UploadFailure,
+        ComputeOrder,
+    }
+
+    #[derive(Default)]
+    struct ScheduleState {
+        next: usize,
+        active: usize,
+        maximum: usize,
+        computes: usize,
+        uploads: usize,
+        events: Vec<String>,
+    }
+
+    struct ScheduleOperations {
+        case: ScheduleCase,
+        state: Mutex<ScheduleState>,
+        changed: Condvar,
+    }
+
+    impl ScheduleOperations {
+        fn new(case: ScheduleCase) -> Self {
+            Self {
+                case,
+                state: Mutex::new(ScheduleState::default()),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn event(&self, event: &str) {
+            self.state.lock().unwrap().events.push(event.into());
+            self.changed.notify_all();
+        }
+
+        fn wait_for(&self, event: &str) {
+            let state = self.state.lock().unwrap();
+            let (state, timed) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                    !state.events.iter().any(|value| value == event)
+                })
+                .unwrap();
+            assert!(
+                !timed.timed_out(),
+                "Missing {event}; events: {:?}",
+                state.events
+            );
+        }
+    }
+
+    impl WorkOperations for ScheduleOperations {
+        type Task = &'static str;
+        type Output = ();
+
+        fn claim(&self, _slot: u8) -> Result<WorkClaim<Self::Task>> {
+            let mut state = self.state.lock().unwrap();
+            let total = if self.case == ScheduleCase::LowDisk {
+                2
+            } else {
+                3
+            };
+            if state.next == total {
+                return Ok(WorkClaim::Idle {
+                    done: state.active == 0,
+                    failed: 0,
+                    retry: Duration::from_millis(10),
+                });
+            }
+            let region = ["a", "b", "c"][state.next];
+            state.next += 1;
+            state.active += 1;
+            state.maximum = state.maximum.max(state.active);
+            assert!(state.active <= 2);
+            state.events.push(format!("claim:{region}"));
+            self.changed.notify_all();
+            Ok(WorkClaim::Task(region))
+        }
+
+        fn region<'a>(&self, task: &'a Self::Task) -> &'a str {
+            task
+        }
+
+        fn prepare(
+            &self,
+            task: &mut Self::Task,
+            _flow: &Arc<PipelineFlow>,
+            _slot: usize,
+        ) -> Result<()> {
+            if *task == "b" {
+                self.wait_for("compute:a");
+            }
+            self.event(&format!("prepare:{task}"));
+            if *task == "b" && self.case == ScheduleCase::ComputeOrder {
+                self.wait_for("claim:c");
+            }
+            Ok(())
+        }
+
+        fn ready(&self, task: &Self::Task) -> Result<()> {
+            if *task == "b"
+                && self.case == ScheduleCase::LowDisk
+                && !self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .events
+                    .iter()
+                    .any(|event| event == "cleanup:a")
+            {
+                self.event("wait:b");
+                bail!("Injected insufficient disk space");
+            }
+            Ok(())
+        }
+
+        fn compute(
+            &self,
+            task: &mut Self::Task,
+            flow: &Arc<PipelineFlow>,
+            _slot: usize,
+        ) -> Result<()> {
+            {
+                let mut state = self.state.lock().unwrap();
+                state.computes += 1;
+                assert_eq!(state.computes, 1);
+            }
+            self.event(&format!("compute:{task}"));
+            if *task == "a" {
+                self.wait_for("prepare:b");
+            } else if *task == "b" {
+                match self.case {
+                    ScheduleCase::Overlap => {
+                        self.wait_for("upload:a");
+                        self.wait_for("prepare:c");
+                    }
+                    ScheduleCase::LowDisk => self.wait_for("cleanup:a"),
+                    ScheduleCase::UploadFailure => {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        while !flow.cancelled.load(Ordering::Acquire) {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "Publication failure did not stop computation scheduling"
+                            );
+                            flow.wait(Duration::from_millis(10));
+                        }
+                    }
+                    ScheduleCase::ComputeOrder => {}
+                }
+            } else if *task == "c" && self.case == ScheduleCase::ComputeOrder {
+                self.wait_for("computed:b");
+            }
+            self.event(&format!("computed:{task}"));
+            self.state.lock().unwrap().computes -= 1;
+            Ok(())
+        }
+
+        fn publish(&self, task: &Self::Task, _output: &(), _cancelled: &AtomicBool) -> Result<()> {
+            {
+                let mut state = self.state.lock().unwrap();
+                state.uploads += 1;
+                assert_eq!(state.uploads, 1);
+            }
+            self.event(&format!("upload:{task}"));
+            if *task == "a" && self.case != ScheduleCase::ComputeOrder {
+                self.wait_for(if self.case == ScheduleCase::LowDisk {
+                    "wait:b"
+                } else {
+                    "compute:b"
+                });
+            }
+            self.state.lock().unwrap().uploads -= 1;
+            ensure!(
+                *task != "a" || self.case != ScheduleCase::UploadFailure,
+                "Injected upload failure"
+            );
+            self.event(&format!("ack:{task}"));
+            Ok(())
+        }
+
+        fn cleanup(&self, task: &Self::Task, _output: &()) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            assert!(state.events.contains(&format!("ack:{task}")));
+            state.events.push(format!("cleanup:{task}"));
+            state.active -= 1;
+            self.changed.notify_all();
+            Ok(())
+        }
+
+        fn release(&self, task: &mut Self::Task, outcome: dispatch::ReleaseOutcome) -> Result<()> {
+            let outcome = match outcome {
+                dispatch::ReleaseOutcome::Failed => "failed",
+                dispatch::ReleaseOutcome::Retry => "retry",
+            };
+            self.event(&format!("release:{task}:{outcome}"));
+            self.state.lock().unwrap().active -= 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn distributed_pipeline_overlaps_compute_upload_and_next_prefetch_with_two_regions() {
+        let operations = ScheduleOperations::new(ScheduleCase::Overlap);
+        execute_work(&operations, true, true).unwrap();
+        let state = operations.state.lock().unwrap();
+        assert_eq!(state.maximum, 2);
+        assert_eq!(state.active, 0);
+        let position = |event: &str| {
+            state
+                .events
+                .iter()
+                .position(|value| value == event)
+                .unwrap()
+        };
+        assert!(position("compute:a") < position("prepare:b"));
+        assert!(position("prepare:b") < position("computed:a"));
+        assert!(position("compute:b") < position("ack:a"));
+        assert!(position("cleanup:a") < position("prepare:c"));
+        assert!(position("prepare:c") < position("computed:b"));
+    }
+
+    #[test]
+    fn distributed_pipeline_waits_for_confirmed_cleanup_before_computing_on_low_disk() {
+        let operations = ScheduleOperations::new(ScheduleCase::LowDisk);
+        execute_work(&operations, true, true).unwrap();
+        let state = operations.state.lock().unwrap();
+        let position = |event: &str| {
+            state
+                .events
+                .iter()
+                .position(|value| value == event)
+                .unwrap()
+        };
+        assert!(position("wait:b") < position("cleanup:a"));
+        assert!(position("cleanup:a") < position("compute:b"));
+        assert_eq!(state.maximum, 2);
+    }
+
+    #[test]
+    fn next_claim_cannot_overtake_a_waiting_prefetch_for_the_compute_turn() {
+        let operations = ScheduleOperations::new(ScheduleCase::ComputeOrder);
+        execute_work(&operations, true, true).unwrap();
+        let state = operations.state.lock().unwrap();
+        let position = |event: &str| {
+            state
+                .events
+                .iter()
+                .position(|value| value == event)
+                .unwrap()
+        };
+        assert!(position("claim:c") < position("compute:b"));
+        assert!(position("computed:b") < position("compute:c"));
+        assert_eq!(state.maximum, 2);
+    }
+
+    #[test]
+    fn distributed_pipeline_failure_retains_builds_and_stops_claiming_or_publishing_more_regions() {
+        let operations = ScheduleOperations::new(ScheduleCase::UploadFailure);
+        let error = execute_work(&operations, true, true).unwrap_err();
+        assert!(error.to_string().contains("Injected upload failure"));
+        let state = operations.state.lock().unwrap();
+        assert_eq!(state.next, 2);
+        for event in [
+            "computed:a",
+            "computed:b",
+            "release:a:failed",
+            "release:b:retry",
+        ] {
+            assert!(
+                state.events.contains(&event.into()),
+                "{event}: {:?}",
+                state.events
+            );
+        }
+        assert!(
+            !state
+                .events
+                .iter()
+                .any(|event| event.starts_with("cleanup:"))
+        );
+        assert!(!state.events.contains(&"upload:b".into()));
+    }
+
+    #[test]
+    fn background_download_cannot_hold_the_queue_before_foreground_source_is_ready() {
+        let flow = Arc::new(PipelineFlow::new(true));
+        flow.phase(0, WorkPhase::Preparing);
+        flow.phase(1, WorkPhase::Preparing);
+        let foreground = flow.control(0);
+        let background = flow.control(1);
+        let thread_flow = Arc::clone(&flow);
+        let (queued, queued_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            background.download_turn().unwrap();
+            let _download = thread_flow.download.lock().unwrap();
+            queued.send(()).unwrap();
+        });
+        assert!(queued_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        foreground.consume();
+        foreground.download_turn().unwrap();
+        let download = flow
+            .download
+            .try_lock()
+            .expect("Background task blocked the foreground download");
+        flow.sources_ready.lock().unwrap()[0] = true;
+        drop(download);
+        queued_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread.join().unwrap();
+        flow.phase(0, WorkPhase::Preparing);
+        assert!(!flow.sources_ready.lock().unwrap()[0]);
+    }
+
+    #[test]
+    fn foreground_download_keeps_the_disk_floor_and_cancel_wakes_background_waiters() {
+        let work = work();
+        let mut settings = runtime();
+        settings.min_free_gib =
+            fs2::available_space(work.path()).unwrap() / (1024 * 1024 * 1024) + 1;
+        let flow = Arc::new(PipelineFlow::new(true));
+        let control = flow.control(0);
+        control.consume();
+        let mut downloader = Downloader::new(&settings).unwrap();
+        downloader.control = Some(control);
+        let result = downloader
+            .executor()
+            .block_on(downloader.budget(&settings, work.path(), 1));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Insufficient space")
+        );
+        let background = flow.control(1);
+        let waiter = std::thread::spawn(move || background.download_turn());
+        flow.stop();
+        assert!(waiter.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn prefetch_failure_stops_other_slots_before_the_source_is_consumed() {
+        let work = work();
+        let flow = Arc::new(PipelineFlow::new(true));
+        let failed = flow.control(0);
+        let other = flow.control(1);
+        failed.consume();
+        let prefetch = Prefetch::controlled(
+            &runtime(),
+            &entry("france"),
+            &work.path().join("missing-catalog.json"),
+            work.path(),
+            Arc::clone(&failed),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !flow.cancelled.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            flow.wait(Duration::from_millis(10));
+        }
+        assert!(flow.cancelled.load(Ordering::Acquire));
+        assert!(failed.failed.load(Ordering::Acquire));
+        assert!(other.cancelled.load(Ordering::Acquire));
+        assert!(!other.failed.load(Ordering::Acquire));
+        assert!(prefetch.consume().is_err());
+        assert!(
+            flow.failure
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .contains("france prefetch failed")
+        );
     }
 
     #[test]
@@ -1988,6 +2877,7 @@ mod tests {
         let mut settings = runtime();
         settings.start_free_gib =
             fs2::available_space(work.path()).unwrap() / (1024 * 1024 * 1024) + 1;
+        settings.min_free_gib = 0;
         let environment = Environment::default();
         let mut operations = Operations {
             runtime: &settings,

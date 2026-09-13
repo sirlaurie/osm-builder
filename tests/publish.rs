@@ -25,6 +25,7 @@ fn lease() -> Lease {
         region: "test-region".into(),
         extract: "europe/germany/berlin".into(),
         device_id: "20000000-0000-4000-8000-000000000002".into(),
+        slot: 0,
         token: "30000000-0000-4000-8000-000000000003".into(),
         generation: 1,
         expires_at: (chrono::Utc::now() + chrono::Duration::minutes(5))
@@ -422,7 +423,7 @@ impl Remote {
                 return reply;
             }
             let expected = serde_json::to_value(lease()).unwrap();
-            if ["batchId", "region", "extract", "deviceId", "token"]
+            if ["batchId", "region", "extract", "deviceId", "slot", "token"]
                 .iter()
                 .any(|key| value["lease"][*key] != expected[*key])
                 || value["lease"]["generation"] != self.lease_generation
@@ -1313,6 +1314,81 @@ fn uploads_respect_bound_and_manifest_waits_for_all_verifications() {
             (0..=(expected + 1)).collect::<Vec<_>>()
         );
     }
+}
+
+#[test]
+fn cancelled_publication_stops_before_manifest_upload_and_keeps_local_artifacts() {
+    for initially_cancelled in [true, false] {
+        let build = Build::new(6);
+        let remote = Remote::new(&build);
+        let server = Remote::server(&remote);
+        let cancel = AtomicBool::new(initially_cancelled);
+        let result = publisher(&server, &[("OSM_UPLOAD_CONCURRENCY", "2")]).publish_with_cancel(
+            build.path(),
+            &lease(),
+            &cancel,
+            |event| {
+                if event.stage == "upload" && event.completed == Some(1) {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+        assert!(result.is_err());
+        let events = server.events();
+        if initially_cancelled {
+            assert!(events.is_empty());
+        } else {
+            assert!(events.iter().any(|(method, _)| method == "PUT"));
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|(method, path)| method == "POST" || path.contains("manifests/"))
+        );
+        assert!(build.path().join("release.json").is_file());
+        assert!(build.path().join(&build.manifest_key).is_file());
+        assert!(
+            build
+                .keys
+                .iter()
+                .all(|key| build.path().join(key).is_file())
+        );
+        assert!(!build.path().join("publish-receipt.json").exists());
+    }
+}
+
+#[test]
+fn cancellation_during_head_does_not_start_put_or_change_local_artifacts() {
+    let build = Build::new(1);
+    let artifacts: Vec<_> = build
+        .keys
+        .iter()
+        .map(String::as_str)
+        .chain([build.manifest_key.as_str(), "release.json"])
+        .map(|key| (key.to_owned(), fs::read(build.path().join(key)).unwrap()))
+        .collect();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let handler_cancel = Arc::clone(&cancel);
+    let server = Server::new(move |request| {
+        if request.method == "HEAD" {
+            handler_cancel.store(true, Ordering::SeqCst);
+            Reply::status(404)
+        } else {
+            Reply::status(200)
+        }
+    });
+    let error = publisher(&server, &[])
+        .publish_with_cancel(build.path(), &lease(), &cancel, |_| {})
+        .unwrap_err();
+    assert!(error.to_string().contains("Publication cancelled"));
+    assert_eq!(
+        server.events(),
+        [("HEAD".to_owned(), format!("/osm-test/{}", build.keys[0]))]
+    );
+    for (key, bytes) in artifacts {
+        assert_eq!(fs::read(build.path().join(key)).unwrap(), bytes);
+    }
+    assert!(!build.path().join("publish-receipt.json").exists());
 }
 
 #[test]

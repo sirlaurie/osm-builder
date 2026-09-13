@@ -1,4 +1,4 @@
-use aura_osm::dispatch::{Client, Guard, Lease, device_id};
+use aura_osm::dispatch::{Client, Guard, Lease, ReleaseOutcome, device_id};
 use aura_osm::source::Region;
 use chrono::{SecondsFormat, Utc};
 use reqwest::header::HeaderValue;
@@ -26,6 +26,7 @@ fn lease() -> Lease {
         region: "test-region".into(),
         extract: "europe/germany/berlin".into(),
         device_id: DEVICE.into(),
+        slot: 0,
         token: TOKEN.into(),
         generation: 1,
         expires_at: (Utc::now() + chrono::Duration::minutes(5))
@@ -168,6 +169,7 @@ fn request_identity_survives_lost_responses_but_changes_for_new_calls() {
             }
             "/admin/jobs/claim" => {
                 assert_eq!(value["deviceId"], DEVICE);
+                assert_eq!(value["slot"], 0);
                 Reply::json(json!({ "batchId": null, "lease": null, "pending": 0,
                     "running": 0, "failed": 0, "retryAfterSeconds": 0 }))
             }
@@ -183,7 +185,7 @@ fn request_identity_survives_lost_responses_but_changes_for_new_calls() {
     }];
     for _ in 0..2 {
         assert_eq!(client.start("bootstrap", &regions).unwrap(), BATCH);
-        assert!(client.claim(DEVICE, &[]).unwrap().lease.is_none());
+        assert!(client.claim(DEVICE, &[], 0).unwrap().lease.is_none());
     }
     let requests = server.requests.lock().unwrap();
     for path in ["/admin/jobs/start", "/admin/jobs/claim"] {
@@ -206,6 +208,9 @@ fn claims_reject_unsafe_paths_invalid_fields_and_other_owners() {
         ("extract", json!("/europe/germany")),
         ("extract", json!("europe//germany")),
         ("deviceId", json!(BATCH)),
+        ("slot", json!(1)),
+        ("slot", json!(2)),
+        ("slot", Value::Null),
         ("token", json!("secret-invalid-token")),
         ("batchId", json!(DEVICE)),
         ("generation", json!(0)),
@@ -223,7 +228,7 @@ fn claims_reject_unsafe_paths_invalid_fields_and_other_owners() {
             }))
         });
         assert!(
-            server.client(2).claim(DEVICE, &[]).is_err(),
+            server.client(2).claim(DEVICE, &[], 0).is_err(),
             "accepted {key}"
         );
         assert_eq!(server.requests.lock().unwrap().len(), 1);
@@ -244,7 +249,7 @@ fn server_clock_skew_does_not_expire_claimed_or_renewed_leases() {
             _ => panic!("Unexpected dispatch path"),
         });
         let client = server.client(1);
-        let claimed = client.claim(DEVICE, &[]).unwrap().lease.unwrap();
+        let claimed = client.claim(DEVICE, &[], 0).unwrap().lease.unwrap();
         let guard = Guard::start(client.clone(), claimed).unwrap();
         assert_eq!(guard.lease().unwrap().expires_at, timestamp);
         let renewed = client.renew(&guard.lease().unwrap()).unwrap();
@@ -255,7 +260,7 @@ fn server_clock_skew_does_not_expire_claimed_or_renewed_leases() {
 
 #[test]
 fn renewal_preserves_fencing_and_release_retries_the_same_lease() {
-    let calls = Mutex::new(0usize);
+    let calls = Mutex::new(HashMap::<String, usize>::new());
     let server = Server::new(move |path, value| {
         assert_eq!(value["lease"]["token"], TOKEN);
         match path {
@@ -265,10 +270,13 @@ fn renewal_preserves_fencing_and_release_retries_the_same_lease() {
                 Reply::json(changed)
             }
             "/admin/jobs/release" => {
+                let outcome = value["outcome"].as_str().unwrap();
+                assert!(["failed", "retry"].contains(&outcome));
                 let mut calls = calls.lock().unwrap();
-                *calls += 1;
+                let count = calls.entry(outcome.to_owned()).or_default();
+                *count += 1;
                 let mut reply = Reply::json(json!({ "success": true }));
-                reply.disconnect = *calls == 1;
+                reply.disconnect = *count == 1;
                 reply
             }
             _ => panic!("Unexpected dispatch path"),
@@ -277,9 +285,86 @@ fn renewal_preserves_fencing_and_release_retries_the_same_lease() {
     let client = server.client(2);
     assert!(client.renew(&lease()).is_err());
     let lease = lease();
-    client.release(&lease).unwrap();
+    client.release(&lease, ReleaseOutcome::Failed).unwrap();
+    client.release(&lease, ReleaseOutcome::Retry).unwrap();
     let requests = server.requests.lock().unwrap();
     assert_eq!(requests[1].1, requests[2].1);
+    assert_eq!(requests[3].1, requests[4].1);
+    assert_eq!(requests[1].1["outcome"], "failed");
+    assert_eq!(requests[3].1["outcome"], "retry");
+}
+
+#[test]
+fn claims_and_guards_keep_device_slots_independent() {
+    let claims = Mutex::new(HashMap::<u8, usize>::new());
+    let server = Server::new(move |path, value| match path {
+        "/admin/jobs/claim" => {
+            let slot = value["slot"].as_u64().unwrap() as u8;
+            let mut offered = lease();
+            offered.slot = slot;
+            offered.renew_after_seconds = 1;
+            if slot == 1 {
+                offered.region = "second-region".into();
+                offered.token = DEVICE.into();
+            }
+            let mut counts = claims.lock().unwrap();
+            let count = counts.entry(slot).or_default();
+            *count += 1;
+            let mut reply = Reply::json(json!({
+                "batchId": BATCH, "lease": offered, "pending": 0,
+                "running": 2, "failed": 0, "retryAfterSeconds": 60,
+            }));
+            reply.disconnect = *count == 1;
+            reply
+        }
+        "/admin/jobs/renew" if value["lease"]["slot"] == 0 => Reply {
+            status: 409,
+            ..Reply::json(json!({ "success": false, "error": "lease_lost" }))
+        },
+        "/admin/jobs/renew" => {
+            let mut renewed = value["lease"].clone();
+            renewed["renewAfterSeconds"] = json!(60);
+            Reply::json(renewed)
+        }
+        _ => panic!("Unexpected dispatch path"),
+    });
+    let client = server.client(2);
+    assert!(client.claim(DEVICE, &[], 2).is_err());
+    assert!(server.requests.lock().unwrap().is_empty());
+    let first = client.claim(DEVICE, &[], 0).unwrap().lease.unwrap();
+    let second = client.claim(DEVICE, &[], 1).unwrap().lease.unwrap();
+    {
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].1, requests[1].1);
+        assert_eq!(requests[2].1, requests[3].1);
+        assert_ne!(requests[0].1["requestId"], requests[2].1["requestId"]);
+    }
+    let first = Guard::start(client.clone(), first).unwrap();
+    let second = Guard::start(client, second).unwrap();
+    let until = Instant::now() + Duration::from_secs(4);
+    while (first.lease().is_ok() || second.lease().unwrap().renew_after_seconds != 60)
+        && Instant::now() < until
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(first.lease().is_err());
+    assert_eq!(second.lease().unwrap().slot, 1);
+    assert_eq!(second.lease().unwrap().renew_after_seconds, 60);
+    drop(first);
+    drop(second);
+}
+
+#[test]
+fn renewal_cannot_move_a_lease_to_the_other_slot() {
+    let server = Server::new(|path, value| {
+        assert_eq!(path, "/admin/jobs/renew");
+        let mut changed = value["lease"].clone();
+        changed["slot"] = json!(1);
+        Reply::json(changed)
+    });
+    assert!(server.client(2).renew(&lease()).is_err());
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
 }
 
 #[test]

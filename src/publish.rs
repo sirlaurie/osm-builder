@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -134,7 +135,12 @@ struct Build {
     objects: Vec<Object>,
 }
 
-fn validate_build(directory: &Path, progress: &mut impl FnMut(Progress)) -> Result<Build> {
+fn validate_build(
+    directory: &Path,
+    cancelled: &AtomicBool,
+    progress: &mut impl FnMut(Progress),
+) -> Result<Build> {
+    ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
     progress(Progress::stage("validate"));
     let root = directory.canonicalize()?;
     let release =
@@ -160,6 +166,7 @@ fn validate_build(directory: &Path, progress: &mut impl FnMut(Progress)) -> Resu
     for (cell, pages) in &manifest.cells {
         let mut previous_id = String::new();
         for hash in pages {
+            ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
             ensure!(hashes.insert(hash), "Repeated block reference: {cell}");
             let key = format!("blocks/{hash}.json");
             let block = read_local(&root, &key, MAX_BLOCK, Some(hash))?;
@@ -348,7 +355,13 @@ impl Publisher {
         bail!("State request has no attempts")
     }
 
-    fn s3_request(&self, method: Method, object: &Object, body: Option<&[u8]>) -> Result<Response> {
+    fn s3_request(
+        &self,
+        method: Method,
+        object: &Object,
+        body: Option<&[u8]>,
+        cancelled: &AtomicBool,
+    ) -> Result<Response> {
         let url = self
             .endpoint
             .join(&format!("{}/{}", self.bucket, object.key))
@@ -413,6 +426,7 @@ impl Publisher {
             if let Some(bytes) = body {
                 request = request.body(bytes.to_vec());
             }
+            ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
             match request.send() {
                 Ok(response) => {
                     let status = response.status();
@@ -425,14 +439,15 @@ impl Publisher {
                 Err(_) if attempt + 1 == self.attempts => bail!("R2 request failed"),
                 Err(_) => {}
             }
+            ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
             self.backoff(attempt);
         }
         bail!("R2 request has no attempts")
     }
 
-    fn head(&self, object: &Object) -> Result<bool> {
+    fn head(&self, object: &Object, cancelled: &AtomicBool) -> Result<bool> {
         let response = self
-            .s3_request(Method::HEAD, object, None)
+            .s3_request(Method::HEAD, object, None, cancelled)
             .map_err(|_| anyhow!("R2 HEAD failed: {}", object.key))?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(false);
@@ -459,20 +474,21 @@ impl Publisher {
         Ok(true)
     }
 
-    fn upload(&self, root: &Path, object: &Object) -> Result<bool> {
-        if self.head(object)? {
+    fn upload(&self, root: &Path, object: &Object, cancelled: &AtomicBool) -> Result<bool> {
+        if self.head(object, cancelled)? {
             return Ok(false);
         }
+        ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
         let local = read_local(root, &object.key, object.size, Some(&object.hash))?;
         let response = self
-            .s3_request(Method::PUT, object, Some(&local.bytes))
+            .s3_request(Method::PUT, object, Some(&local.bytes), cancelled)
             .map_err(|_| anyhow!("R2 upload failed: {}", object.key))?;
         if matches!(
             response.status(),
             StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED
         ) {
             ensure!(
-                self.head(object)?,
+                self.head(object, cancelled)?,
                 "Concurrent upload did not create object: {}",
                 object.key
             );
@@ -484,7 +500,7 @@ impl Publisher {
             object.key
         );
         ensure!(
-            self.head(object)?,
+            self.head(object, cancelled)?,
             "Uploaded object is missing: {}",
             object.key
         );
@@ -505,9 +521,19 @@ impl Publisher {
         &self,
         directory: &Path,
         lease: &Lease,
+        progress: impl FnMut(Progress),
+    ) -> Result<Value> {
+        self.publish_with_cancel(directory, lease, &AtomicBool::new(false), progress)
+    }
+
+    pub fn publish_with_cancel(
+        &self,
+        directory: &Path,
+        lease: &Lease,
+        cancelled: &AtomicBool,
         mut progress: impl FnMut(Progress),
     ) -> Result<Value> {
-        let build = validate_build(directory, &mut progress)?;
+        let build = validate_build(directory, cancelled, &mut progress)?;
         ensure!(
             lease.region == build.release.region,
             "Publication does not match the leased region"
@@ -532,14 +558,17 @@ impl Publisher {
                     loop {
                         let object = {
                             let mut queue = queue.lock().expect("upload queue lock");
-                            if queue.1 || queue.0 == blocks.len() {
+                            if queue.1
+                                || cancelled.load(Ordering::Acquire)
+                                || queue.0 == blocks.len()
+                            {
                                 break;
                             }
                             let object = &blocks[queue.0];
                             queue.0 += 1;
                             object
                         };
-                        let result = self.upload(root, object);
+                        let result = self.upload(root, object, cancelled);
                         if result.is_err() {
                             queue.lock().expect("upload queue lock").1 = true;
                         }
@@ -571,8 +600,9 @@ impl Publisher {
             }
             Ok(())
         })?;
+        ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
         let manifest = build.objects.last().expect("validated manifest");
-        let uploaded = self.upload(&build.root, manifest)?;
+        let uploaded = self.upload(&build.root, manifest, cancelled)?;
         record_upload(&mut stats, manifest.size, uploaded);
         progress(stats.clone());
         let mut published = None;
@@ -583,6 +613,7 @@ impl Publisher {
                 ..Progress::stage("publish")
             };
             progress(event.clone());
+            ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
             let response = self.client.post(self.worker.join("admin/publish").expect("validated origin"))
                 .header("Authorization", self.authorization.clone())
                 .json(&json!({ "region": build.release.region, "manifest": build.release.manifest, "lease": lease })).send();
@@ -699,6 +730,9 @@ impl Default for ProgressReporter {
 }
 
 impl ProgressReporter {
+    pub fn for_region(region: &str) -> Self {
+        Self::with_line(ProgressLine::for_region(region))
+    }
     #[cfg(test)]
     fn with_output(
         output: Box<dyn std::io::Write + Send>,
