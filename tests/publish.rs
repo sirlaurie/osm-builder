@@ -1,4 +1,5 @@
 use aura_osm::config::{Environment, Runtime};
+use aura_osm::dispatch::Lease;
 use aura_osm::format::{MAX_BLOCK, MAX_CURRENT, hash_bytes};
 use aura_osm::publish::{Progress, PublishConfig, Publisher};
 use serde_json::{Value, json};
@@ -17,6 +18,20 @@ const TOKEN: &str = "test-publish-secret-test-publish-secret";
 const SECRET: &str = "test-aws-secret";
 const REVISION: &str = "12345678-1234-1234-1234-123456789abc";
 const NEW_REVISION: &str = "87654321-4321-4321-4321-cba987654321";
+
+fn lease() -> Lease {
+    Lease {
+        batch_id: "10000000-0000-4000-8000-000000000001".into(),
+        region: "test-region".into(),
+        extract: "europe/germany/berlin".into(),
+        device_id: "20000000-0000-4000-8000-000000000002".into(),
+        token: "30000000-0000-4000-8000-000000000003".into(),
+        generation: 1,
+        expires_at: (chrono::Utc::now() + chrono::Duration::minutes(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        renew_after_seconds: 60,
+    }
+}
 
 struct Wave {
     total: usize,
@@ -345,11 +360,12 @@ struct Remote {
     missing_race: bool,
     lost_put: bool,
     lost_publish: bool,
-    publish_status: Option<u16>,
-    changed_revision: bool,
+    publish_states: VecDeque<Value>,
+    publish_replies: VecDeque<Reply>,
     acknowledge_without_commit: bool,
     bad_verification: bool,
-    publish_bases: Vec<Value>,
+    publish_leases: Vec<Value>,
+    lease_generation: u64,
 }
 
 impl Remote {
@@ -364,11 +380,12 @@ impl Remote {
             missing_race: false,
             lost_put: false,
             lost_publish: false,
-            publish_status: None,
-            changed_revision: false,
+            publish_states: VecDeque::new(),
+            publish_replies: VecDeque::new(),
             acknowledge_without_commit: false,
             bad_verification: false,
-            publish_bases: Vec::new(),
+            publish_leases: Vec::new(),
+            lease_generation: 1,
         }))
     }
 
@@ -396,22 +413,57 @@ impl Remote {
             let value: Value = serde_json::from_slice(&request.body).unwrap();
             assert_eq!(value["region"], self.release["region"]);
             assert_eq!(value["manifest"], self.release["manifest"]);
-            self.publish_bases.push(value["baseRevision"].clone());
-            if self.changed_revision {
-                self.current = json!({ "schema": 1, "revision": NEW_REVISION, "regions": [] });
+            assert!(value.get("baseRevision").is_none());
+            self.publish_leases.push(value["lease"].clone());
+            if let Some(current) = self.publish_states.pop_front() {
+                self.current = current;
             }
-            if let Some(status) = self.publish_status {
-                return Reply::status(status);
+            if let Some(reply) = self.publish_replies.pop_front() {
+                return reply;
+            }
+            let expected = serde_json::to_value(lease()).unwrap();
+            if ["batchId", "region", "extract", "deviceId", "token"]
+                .iter()
+                .any(|key| value["lease"][*key] != expected[*key])
+                || value["lease"]["generation"] != self.lease_generation
+            {
+                return Reply {
+                    status: 409,
+                    ..Reply::json(&json!({ "success": false, "error": "lease_lost" }))
+                };
+            }
+            let mut regions = self.current["regions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if regions.iter().any(|region| {
+                region["region"] == self.release["region"]
+                    && region["manifest"] == self.release["manifest"]
+            }) {
+                return Reply::json(
+                    &json!({ "success": true, "revision": self.current["revision"], "unchanged": true }),
+                );
             }
             if !self.acknowledge_without_commit {
-                self.current = json!({ "schema": 1, "revision": REVISION, "regions": [{
+                regions.retain(|region| region["region"] != self.release["region"]);
+                regions.push(json!({
                     "region": self.release["region"], "manifest": self.release["manifest"],
                     "sourceTimestamp": self.release["sourceTimestamp"], "bbox": [-1,-1,1,1],
-                }] });
+                }));
+                let revision = if self.current.is_null() {
+                    REVISION.to_owned()
+                } else {
+                    format!("00000000-0000-4000-8000-{:012}", self.publish_leases.len())
+                };
+                self.current = json!({ "schema": 1, "revision": revision, "regions": regions });
             }
+            let disconnect = self.lost_publish;
+            self.lost_publish = false;
             return Reply {
-                disconnect: self.lost_publish,
-                ..Reply::json(&json!({ "success": true }))
+                disconnect,
+                ..Reply::json(
+                    &json!({ "success": true, "revision": self.current["revision"].as_str().unwrap_or(REVISION), "unchanged": false }),
+                )
             };
         }
         let key = request.path.strip_prefix("/osm-test/").unwrap();
@@ -488,7 +540,7 @@ fn validates_uploads_blocks_then_manifest_publishes_and_resumes() {
     let publisher = publisher(&server, &[]);
     let mut progress = Vec::new();
     let receipt = publisher
-        .publish(build.path(), |event| progress.push(event))
+        .publish(build.path(), &lease(), |event| progress.push(event))
         .unwrap();
     assert_eq!(receipt["uploaded"], 2);
     assert_eq!(receipt["reused"], 0);
@@ -504,9 +556,7 @@ fn validates_uploads_blocks_then_manifest_publishes_and_resumes() {
             .iter()
             .map(|(method, _)| method.as_str())
             .collect::<Vec<_>>(),
-        [
-            "GET", "HEAD", "PUT", "HEAD", "HEAD", "PUT", "HEAD", "POST", "GET"
-        ]
+        ["HEAD", "PUT", "HEAD", "HEAD", "PUT", "HEAD", "POST", "GET"]
     );
     let puts: Vec<_> = server
         .events()
@@ -530,7 +580,7 @@ fn validates_uploads_blocks_then_manifest_publishes_and_resumes() {
         [Some(0), Some(1), Some(2)]
     );
     assert_eq!(progress.last().unwrap().stage, "done");
-    let second = publisher.publish(build.path(), |_| {}).unwrap();
+    let second = publisher.publish(build.path(), &lease(), |_| {}).unwrap();
     assert_eq!(second["uploaded"], 0);
     assert_eq!(second["reused"], 2);
     assert_eq!(second["bytes"], 0);
@@ -636,7 +686,7 @@ fn all_local_failures_precede_network() {
         }
         let remote = Remote::new(&build);
         let server = Remote::server(&remote);
-        let result = publisher(&server, &[]).publish(build.path(), |_| {});
+        let result = publisher(&server, &[]).publish(build.path(), &lease(), |_| {});
         assert!(result.is_err(), "case {case} accepted");
         assert!(server.events().is_empty(), "case {case} contacted network");
     }
@@ -654,7 +704,7 @@ fn local_symlinks_and_changed_files_are_rejected() {
     let server = Remote::server(&remote);
     assert!(
         publisher(&server, &[])
-            .publish(build.path(), |_| {})
+            .publish(build.path(), &lease(), |_| {})
             .is_err()
     );
     assert!(server.events().is_empty());
@@ -665,14 +715,14 @@ fn local_symlinks_and_changed_files_are_rejected() {
     let changed = Arc::new(AtomicBool::new(false));
     let changed_request = changed.clone();
     let server = Server::new(move |request| {
-        if request.path == "/admin/state" && !changed_request.swap(true, Ordering::SeqCst) {
+        if request.method == "HEAD" && !changed_request.swap(true, Ordering::SeqCst) {
             fs::write(&block, b"[]").unwrap();
         }
         remote.lock().unwrap().handle(request)
     });
     assert!(
         publisher(&server, &[])
-            .publish(build.path(), |_| {})
+            .publish(build.path(), &lease(), |_| {})
             .is_err()
     );
     assert!(
@@ -708,7 +758,7 @@ fn immutable_mismatches_fail_without_overwrite() {
             .insert(build.keys[0].clone(), (size + size_delta, metadata));
         let server = Remote::server(&remote);
         let error = publisher(&server, &[])
-            .publish(build.path(), |_| {})
+            .publish(build.path(), &lease(), |_| {})
             .unwrap_err();
         assert!(error.to_string().contains("Immutable object mismatch"));
         assert!(
@@ -732,7 +782,7 @@ fn conditional_races_and_lost_upload_acknowledgements_require_verified_objects()
         }
         let server = Remote::server(&remote);
         let receipt = publisher(&server, &[])
-            .publish(build.path(), |_| {})
+            .publish(build.path(), &lease(), |_| {})
             .unwrap();
         assert_eq!(receipt["reused"], if race == 0 { 1 } else { 2 });
     }
@@ -746,7 +796,7 @@ fn conditional_races_and_lost_upload_acknowledgements_require_verified_objects()
     let server = Remote::server(&remote);
     assert!(
         publisher(&server, &[])
-            .publish(build.path(), |_| {})
+            .publish(build.path(), &lease(), |_| {})
             .unwrap_err()
             .to_string()
             .contains("Concurrent upload did not create object")
@@ -771,7 +821,7 @@ fn failed_upload_or_verification_blocks_manifest_and_completion() {
         let mut progress = Vec::new();
         assert!(
             publisher(&server, &[])
-                .publish(build.path(), |event| progress.push(event))
+                .publish(build.path(), &lease(), |event| progress.push(event))
                 .is_err()
         );
         assert!(
@@ -799,48 +849,251 @@ fn failed_upload_or_verification_blocks_manifest_and_completion() {
     }
 }
 
+fn region_release(region: &str, manifest: &str) -> Value {
+    json!({ "region": region, "manifest": manifest,
+        "sourceTimestamp": "2026-09-10T00:00:00Z", "bbox": [-1,-1,1,1] })
+}
+
 #[test]
-fn publication_ack_recovery_and_cas_do_not_rebase() {
+fn publication_ack_recovery_handles_lost_response() {
     let build = Build::new(1);
     let remote = Remote::new(&build);
     remote.lock().unwrap().lost_publish = true;
     let server = Remote::server(&remote);
     let receipt = publisher(&server, &[])
-        .publish(build.path(), |_| {})
+        .publish(build.path(), &lease(), |_| {})
         .unwrap();
     assert_eq!(receipt["revision"], REVISION);
-    assert_eq!(remote.lock().unwrap().publish_bases, [Value::Null]);
+    let remote = remote.lock().unwrap();
+    assert_eq!(remote.publish_leases.len(), 2);
+    assert_eq!(remote.publish_leases[0], remote.publish_leases[1]);
+}
 
-    for (status, changed, expected) in [
-        (409, false, "Publish conflict"),
-        (503, true, "remote revision changed"),
-        (503, false, "after 2 attempts"),
+#[test]
+fn publication_uses_the_same_lease_after_other_regions_change() {
+    for existing in [false, true] {
+        for status in [200, 503, 0] {
+            let build = Build::new(1);
+            let remote = Remote::new(&build);
+            let kept = region_release("kept-region", &"b".repeat(64));
+            let other = region_release("other-region", &"c".repeat(64));
+            let mut regions = vec![kept.clone()];
+            if existing {
+                regions.push(region_release("test-region", &"a".repeat(64)));
+            }
+            {
+                let mut remote = remote.lock().unwrap();
+                remote.current = json!({ "schema": 1, "revision": REVISION, "regions": regions });
+                regions.push(other.clone());
+                remote.publish_states.push_back(
+                    json!({ "schema": 1, "revision": NEW_REVISION, "regions": regions }),
+                );
+                if status != 200 {
+                    remote.publish_replies.push_back(Reply {
+                        disconnect: status == 0,
+                        ..Reply::status(503)
+                    });
+                }
+            }
+            let server = Remote::server(&remote);
+            let authorization = lease();
+            let receipt = publisher(&server, &[("OSM_HTTP_ATTEMPTS", "2")])
+                .publish(build.path(), &authorization, |_| {})
+                .unwrap();
+            assert_eq!(
+                server
+                    .events()
+                    .iter()
+                    .filter(|(method, _)| method == "PUT")
+                    .count(),
+                build.keys.len() + 1
+            );
+            let remote = remote.lock().unwrap();
+            assert_eq!(
+                remote.publish_leases.len(),
+                if status == 200 { 1 } else { 2 }
+            );
+            assert!(
+                remote
+                    .publish_leases
+                    .iter()
+                    .all(|lease| lease == &serde_json::to_value(&authorization).unwrap())
+            );
+            let published = remote.current["regions"].as_array().unwrap();
+            assert_eq!(published.len(), 3);
+            assert!(published.contains(&kept));
+            assert!(published.contains(&other));
+            assert!(published.contains(&region_release(
+                "test-region",
+                build.release["manifest"].as_str().unwrap(),
+            )));
+            assert_eq!(receipt["revision"], remote.current["revision"]);
+        }
+    }
+}
+
+#[test]
+fn publication_fences_a_reassigned_lease_without_retrying() {
+    let build = Build::new(0);
+    let remote = Remote::new(&build);
+    let concurrent = json!({ "schema": 1, "revision": NEW_REVISION,
+        "regions": [region_release("test-region", &"d".repeat(64))] });
+    {
+        let mut remote = remote.lock().unwrap();
+        remote.current = concurrent.clone();
+        remote.lease_generation = 2;
+    }
+    let server = Remote::server(&remote);
+    let error = publisher(&server, &[("OSM_HTTP_ATTEMPTS", "2")])
+        .publish(build.path(), &lease(), |_| {})
+        .unwrap_err();
+    assert!(error.to_string().contains("lease_lost"));
+    let remote = remote.lock().unwrap();
+    assert_eq!(remote.publish_leases.len(), 1);
+    assert_eq!(remote.current, concurrent);
+    assert!(!build.path().join("publish-receipt.json").exists());
+}
+
+#[test]
+fn publication_uncertain_response_recovers_an_already_completed_target() {
+    for status in [503, 0] {
+        let build = Build::new(0);
+        let remote = Remote::new(&build);
+        let current = json!({ "schema": 1, "revision": NEW_REVISION,
+            "regions": [region_release("other-region", &"b".repeat(64)),
+                region_release("test-region", build.release["manifest"].as_str().unwrap())] });
+        {
+            let mut remote = remote.lock().unwrap();
+            remote.current = json!({ "schema": 1, "revision": REVISION, "regions": [] });
+            remote.publish_states.push_back(current.clone());
+            remote.publish_replies.push_back(Reply {
+                status: 503,
+                disconnect: status == 0,
+                ..Reply::status(503)
+            });
+        }
+        let server = Remote::server(&remote);
+        let receipt = publisher(&server, &[("OSM_HTTP_ATTEMPTS", "2")])
+            .publish(build.path(), &lease(), |_| {})
+            .unwrap();
+        let remote = remote.lock().unwrap();
+        assert_eq!(remote.publish_leases.len(), 2);
+        assert_eq!(remote.publish_leases[0], remote.publish_leases[1]);
+        assert_eq!(remote.current, current);
+        assert_eq!(receipt["revision"], NEW_REVISION);
+    }
+}
+
+#[test]
+fn publication_uncertain_responses_stop_at_the_configured_attempt_limit() {
+    let build = Build::new(0);
+    let remote = Remote::new(&build);
+    {
+        let mut remote = remote.lock().unwrap();
+        remote.current = json!({ "schema": 1, "revision": REVISION, "regions": [] });
+        remote.publish_replies = VecDeque::from([Reply::status(503), Reply::status(503)]);
+    }
+    let server = Remote::server(&remote);
+    let error = publisher(&server, &[("OSM_HTTP_ATTEMPTS", "2")])
+        .publish(build.path(), &lease(), |_| {})
+        .unwrap_err();
+    assert!(error.to_string().contains("after 2 attempts"), "{error}");
+    assert_eq!(remote.lock().unwrap().publish_leases.len(), 2);
+    assert!(!build.path().join("publish-receipt.json").exists());
+}
+
+#[test]
+fn publication_existing_manifest_requires_a_completion_acknowledgement() {
+    for reply in [
+        Reply::status(503),
+        Reply::json(&json!({ "success": true, "revision": REVISION })),
+        Reply {
+            body: format!("{TOKEN} {SECRET}").into_bytes(),
+            ..Reply::status(200)
+        },
     ] {
-        let build = Build::new(1);
+        let build = Build::new(0);
         let remote = Remote::new(&build);
         {
             let mut remote = remote.lock().unwrap();
-            remote.publish_status = Some(status);
-            remote.changed_revision = changed;
-            remote.current = json!({ "schema":1, "revision":REVISION, "regions":[] });
+            remote.current = json!({ "schema": 1, "revision": REVISION,
+                "regions": [region_release("test-region", build.release["manifest"].as_str().unwrap())] });
+            remote.publish_replies = VecDeque::from([reply.clone(), reply]);
         }
         let server = Remote::server(&remote);
+        let mut progress = Vec::new();
         let error = publisher(&server, &[("OSM_HTTP_ATTEMPTS", "2")])
-            .publish(build.path(), |_| {})
+            .publish(build.path(), &lease(), |event| progress.push(event))
             .unwrap_err();
-        assert!(error.to_string().contains(expected), "{error}");
+        let message = format!("{error:#}");
+        assert!(!message.contains(TOKEN) && !message.contains(SECRET));
+        let remote = remote.lock().unwrap();
+        assert_eq!(remote.publish_leases.len(), 2);
+        assert_eq!(remote.publish_leases[0], remote.publish_leases[1]);
         assert!(
-            remote
-                .lock()
-                .unwrap()
-                .publish_bases
+            !server
+                .events()
                 .iter()
-                .all(|base| base == REVISION)
+                .any(|(_, path)| path == "/admin/state")
         );
-        assert_eq!(
-            remote.lock().unwrap().publish_bases.len(),
-            if status == 503 && !changed { 2 } else { 1 }
+        assert!(
+            !progress
+                .iter()
+                .any(|event| matches!(event.stage, "receipt" | "done"))
         );
+        assert!(!build.path().join("publish-receipt.json").exists());
+    }
+}
+
+#[test]
+fn publication_nonrevision_conflicts_are_sanitized_and_not_retried() {
+    let mut cases = Vec::new();
+    for code in [
+        "lease_lost",
+        "source_regression",
+        "region_limit",
+        "current_too_large",
+    ] {
+        cases.push((
+            serde_json::to_vec(&json!({ "success": false, "error": code,
+                "message": format!("{TOKEN} {SECRET}") }))
+            .unwrap(),
+            Some(code),
+        ));
+    }
+    cases.extend([
+        (
+            serde_json::to_vec(&json!({ "error": "lease_lost", "message": "x".repeat(4096) }))
+                .unwrap(),
+            None,
+        ),
+        (format!("{TOKEN} {SECRET}").into_bytes(), None),
+        (
+            serde_json::to_vec(&json!({ "success": false, "error": TOKEN })).unwrap(),
+            None,
+        ),
+        (
+            serde_json::to_vec(&json!({ "success": false, "error": null })).unwrap(),
+            None,
+        ),
+    ]);
+    for (body, code) in cases {
+        let build = Build::new(0);
+        let remote = Remote::new(&build);
+        remote.lock().unwrap().publish_replies.push_back(Reply {
+            body,
+            ..Reply::status(409)
+        });
+        let server = Remote::server(&remote);
+        let error = publisher(&server, &[("OSM_HTTP_ATTEMPTS", "2")])
+            .publish(build.path(), &lease(), |_| {})
+            .unwrap_err();
+        let message = format!("{error:#}");
+        if let Some(code) = code {
+            assert!(message.contains(code), "{message}");
+        }
+        assert!(!message.contains(TOKEN) && !message.contains(SECRET));
+        assert_eq!(remote.lock().unwrap().publish_leases.len(), 1);
         assert!(!build.path().join("publish-receipt.json").exists());
     }
 }
@@ -853,7 +1106,7 @@ fn acknowledged_publish_must_be_current_and_receipt_symlink_is_not_followed() {
     let server = Remote::server(&remote);
     assert!(
         publisher(&server, &[])
-            .publish(build.path(), |_| {})
+            .publish(build.path(), &lease(), |_| {})
             .unwrap_err()
             .to_string()
             .contains("acknowledged but target manifest")
@@ -869,7 +1122,7 @@ fn acknowledged_publish_must_be_current_and_receipt_symlink_is_not_followed() {
     let server = Remote::server(&remote);
     assert!(
         publisher(&server, &[])
-            .publish(build.path(), |_| {})
+            .publish(build.path(), &lease(), |_| {})
             .is_err()
     );
     assert_eq!(fs::read(marker).unwrap(), b"keep");
@@ -1048,7 +1301,7 @@ fn uploads_respect_bound_and_manifest_waits_for_all_verifications() {
         let mut progress: Vec<Progress> = Vec::new();
         let configured = concurrency.to_string();
         publisher(&server, &[("OSM_UPLOAD_CONCURRENCY", &configured)])
-            .publish(build.path(), |event| progress.push(event))
+            .publish(build.path(), &lease(), |event| progress.push(event))
             .unwrap();
         assert_eq!(*peak.lock().unwrap(), concurrency);
         assert_eq!(
@@ -1098,7 +1351,7 @@ fn failed_object_stops_dispatch_and_drains_inflight_objects() {
     let directory = build.path().to_owned();
     let task = thread::spawn(move || {
         let mut progress = Vec::new();
-        let result = publisher.publish(&directory, |event| progress.push(event));
+        let result = publisher.publish(&directory, &lease(), |event| progress.push(event));
         (result, progress)
     });
     failure_observed
@@ -1151,7 +1404,7 @@ fn r2_errors_do_not_expose_response_bodies_or_follow_redirects() {
             }
         });
         let error = publisher(&server, &[])
-            .publish(build.path(), |_| {})
+            .publish(build.path(), &lease(), |_| {})
             .unwrap_err()
             .to_string();
         assert!(!error.contains(TOKEN) && !error.contains(SECRET));

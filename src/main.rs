@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use aura_osm::{
     build,
     config::{Environment, Runtime},
-    format, incremental, pipeline,
+    dispatch, format, incremental, pipeline,
     publish::{ProgressReporter, PublishConfig, Publisher},
     schedule, source,
 };
@@ -50,14 +50,32 @@ enum Action {
     #[command(about = "Initialize, update and publish regions")]
     Bootstrap {
         region: String,
+        #[arg(long, help = "Submit the batch without claiming tasks on this process")]
+        submit_only: bool,
         #[arg(
             long,
             help = "Remove each region's local data after confirmed publication"
         )]
         cleanup: bool,
     },
-    #[command(about = "Apply daily changes and publish; requires existing indexes")]
-    Update { region: String },
+    #[command(about = "Submit regional updates and process the batch")]
+    Update {
+        region: String,
+        #[arg(long, help = "Submit the batch without claiming tasks on this process")]
+        submit_only: bool,
+    },
+    #[command(about = "Claim and process cloud regional tasks")]
+    Work {
+        #[arg(
+            long,
+            help = "Exit when the current batch has no pending or running tasks"
+        )]
+        once: bool,
+        #[arg(long, help = "Remove local region data after confirmed publication")]
+        cleanup: bool,
+    },
+    #[command(about = "Read cloud batch and device status")]
+    Jobs,
     #[command(about = "Validate and publish a completed build")]
     Publish { directory: PathBuf },
     #[command(about = "Read verified cloud publication state")]
@@ -143,8 +161,36 @@ fn run(cli: Cli) -> Result<()> {
     configure_temporary_directory(&root)?;
     let environment = Environment::load(&root)?;
     let runtime = Runtime::load(&root, &environment)?;
+    match &cli.command {
+        Action::Bootstrap {
+            region,
+            cleanup,
+            submit_only: true,
+        } => {
+            ensure!(
+                !cleanup,
+                "--cleanup applies to processing; use work --cleanup on processing devices"
+            );
+            println!(
+                "Submitted batch: {}",
+                pipeline::submit(&root, &runtime, &environment, "bootstrap", region)?
+            );
+            return Ok(());
+        }
+        Action::Update {
+            region,
+            submit_only: true,
+        } => {
+            println!(
+                "Submitted batch: {}",
+                pipeline::submit(&root, &runtime, &environment, "update", region)?
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
     let _lock = match cli.command {
-        Action::List | Action::PublishedState | Action::Schedule { .. } => None,
+        Action::List | Action::Jobs | Action::PublishedState | Action::Schedule { .. } => None,
         _ => Some(lock_pipeline(&root)?),
     };
     match cli.command {
@@ -177,7 +223,9 @@ fn run(cli: Cli) -> Result<()> {
             job.as_deref(),
             false,
         )?,
-        Action::Bootstrap { region, cleanup } => pipeline::run(
+        Action::Bootstrap {
+            region, cleanup, ..
+        } => pipeline::run(
             &root,
             &runtime,
             &environment,
@@ -186,7 +234,7 @@ fn run(cli: Cli) -> Result<()> {
             None,
             cleanup,
         )?,
-        Action::Update { region } => pipeline::run(
+        Action::Update { region, .. } => pipeline::run(
             &root,
             &runtime,
             &environment,
@@ -198,10 +246,43 @@ fn run(cli: Cli) -> Result<()> {
         Action::Publish { directory } => {
             let publisher =
                 Publisher::new(&runtime, &PublishConfig::from_environment(&environment)?)?;
+            let release = format::validate_release(
+                &aura_osm::storage::read_local(
+                    &directory.canonicalize()?,
+                    "release.json",
+                    format::MAX_CURRENT,
+                    None,
+                )?
+                .value,
+            )?;
+            let entry = source::regions(&root.join("config/regions.json"))?
+                .into_iter()
+                .find(|entry| entry.id == release.region)
+                .context("Build region is not configured")?;
+            let client = publisher.coordinator();
+            client.start("update", std::slice::from_ref(&entry))?;
+            let device = dispatch::device_id(&runtime.data_dir)?;
+            let lease = client.claim(&device, &[entry.id])?.lease.context(
+                "Publication task is already claimed; use osm jobs to inspect its owner",
+            )?;
+            let guard = dispatch::Guard::start(client.clone(), lease.clone())?;
             let mut progress = ProgressReporter::default();
-            let receipt = publisher.publish(&directory, |event| progress.update(event))?;
+            let result =
+                publisher.publish(&directory, &guard.lease()?, |event| progress.update(event));
             drop(progress);
-            print_json(&receipt)?;
+            drop(guard);
+            if result.is_err() {
+                let _ = client.release(&lease);
+            }
+            print_json(&result?)?;
+        }
+        Action::Work { once, cleanup } => {
+            pipeline::work(&root, &runtime, &environment, once, cleanup)?
+        }
+        Action::Jobs => {
+            let publisher =
+                Publisher::new(&runtime, &PublishConfig::from_environment(&environment)?)?;
+            print_json(&publisher.coordinator().jobs()?)?;
         }
         Action::PublishedState => {
             let publisher =

@@ -52,10 +52,11 @@ fn lower_digit(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte.is_ascii_digit()
 }
 
-fn valid_extract(extract: &str) -> bool {
-    extract
-        .split('/')
-        .all(|part| !part.is_empty() && part.bytes().all(|byte| lower_digit(byte) || byte == b'-'))
+pub(crate) fn valid_extract(extract: &str) -> bool {
+    extract.len() <= 512
+        && extract.split('/').all(|part| {
+            !part.is_empty() && part.bytes().all(|byte| lower_digit(byte) || byte == b'-')
+        })
 }
 
 pub fn regions(path: &Path) -> Result<Vec<Region>> {

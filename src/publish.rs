@@ -1,4 +1,5 @@
 use crate::config::{Environment, Runtime};
+use crate::dispatch::{self, Lease};
 use crate::format::{self, Current, MAX_BLOCK, MAX_CURRENT, MAX_MANIFEST, Release};
 use crate::progress::ProgressLine;
 use crate::storage::{atomic_write, read_local};
@@ -490,11 +491,27 @@ impl Publisher {
         Ok(true)
     }
 
-    pub fn publish(&self, directory: &Path, mut progress: impl FnMut(Progress)) -> Result<Value> {
+    pub fn coordinator(&self) -> dispatch::Client {
+        dispatch::Client::new(
+            self.client.clone(),
+            self.worker.clone(),
+            self.authorization.clone(),
+            self.attempts,
+            self.retry_delay,
+        )
+    }
+
+    pub fn publish(
+        &self,
+        directory: &Path,
+        lease: &Lease,
+        mut progress: impl FnMut(Progress),
+    ) -> Result<Value> {
         let build = validate_build(directory, &mut progress)?;
-        progress(Progress::stage("state"));
-        let initial = self.read_state()?;
-        let base_revision = initial.as_ref().map(|state| state.revision.clone());
+        ensure!(
+            lease.region == build.release.region,
+            "Publication does not match the leased region"
+        );
         let mut stats = Progress {
             completed: Some(0),
             total: Some(build.objects.len()),
@@ -568,44 +585,68 @@ impl Publisher {
             progress(event.clone());
             let response = self.client.post(self.worker.join("admin/publish").expect("validated origin"))
                 .header("Authorization", self.authorization.clone())
-                .json(&json!({ "region": build.release.region, "manifest": build.release.manifest, "baseRevision": base_revision })).send();
+                .json(&json!({ "region": build.release.region, "manifest": build.release.manifest, "lease": lease })).send();
             let status = response.as_ref().ok().map(Response::status);
-            drop(response);
             if status == Some(StatusCode::CONFLICT) {
-                bail!("Publish conflict: remote revision changed; no rebase was attempted");
+                let error = response.ok().and_then(|response| {
+                    let mut bytes = Vec::new();
+                    response.take(4097).read_to_end(&mut bytes).ok()?;
+                    if bytes.len() > 4096 {
+                        return None;
+                    }
+                    let value: Value = serde_json::from_slice(&bytes).ok()?;
+                    match value["error"].as_str()? {
+                        "lease_lost" => Some("lease_lost"),
+                        "source_regression" => Some("source_regression"),
+                        "region_limit" => Some("region_limit"),
+                        "current_too_large" => Some("current_too_large"),
+                        _ => None,
+                    }
+                });
+                bail!("Publish rejected: {}", error.unwrap_or("HTTP 409"));
             }
             if let Some(status) = status.filter(|status| {
                 !status.is_success()
                     && status.as_u16() < 500
                     && *status != StatusCode::TOO_MANY_REQUESTS
+                    && *status != StatusCode::CONFLICT
             }) {
                 bail!("Publish rejected: HTTP {}", status.as_u16());
             }
-            progress(Progress {
-                stage: "confirm",
-                ..event
-            });
-            let state = self.read_state()?;
-            if state.as_ref().is_some_and(|state| {
-                state.regions.iter().any(|region| {
-                    region.region == build.release.region
-                        && region.manifest == build.release.manifest
+            let acknowledged = response
+                .ok()
+                .filter(|response| response.status().is_success())
+                .and_then(|response| {
+                    let mut bytes = Vec::new();
+                    response.take(4097).read_to_end(&mut bytes).ok()?;
+                    (bytes.len() <= 4096).then_some(())?;
+                    let value: Value = serde_json::from_slice(&bytes).ok()?;
+                    (value["success"] == true
+                        && value["revision"].is_string()
+                        && value["unchanged"].is_boolean())
+                    .then_some(())
                 })
-            }) {
+                .is_some();
+            if acknowledged {
+                progress(Progress {
+                    stage: "confirm",
+                    ..event
+                });
+                let state = self.read_state()?;
+                ensure!(
+                    state.as_ref().is_some_and(|state| state
+                        .regions
+                        .iter()
+                        .any(|region| region.region == build.release.region
+                            && region.manifest == build.release.manifest)),
+                    "Publish acknowledged but target manifest is not current"
+                );
                 published = state;
                 break;
             }
             ensure!(
-                !status.is_some_and(|status| status.is_success()),
-                "Publish acknowledged but target manifest is not current"
-            );
-            ensure!(
-                state.as_ref().map(|state| &state.revision) == base_revision.as_ref(),
-                "Publish outcome is unconfirmed and remote revision changed; no rebase was attempted"
-            );
-            ensure!(
                 attempt + 1 < self.attempts,
-                "Publish outcome is unconfirmed after {} attempts; inspect /admin/state before retrying",
+                "Publish outcome is unconfirmed after {} attempts; inspect osm jobs before retrying",
                 self.attempts
             );
             self.backoff(attempt);

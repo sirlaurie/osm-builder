@@ -1,6 +1,6 @@
 mod common;
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs};
 
 use aura_osm::{
     config::{Environment, Runtime},
@@ -12,7 +12,18 @@ use serde_json::{Value, json};
 #[test]
 fn rebuild_reads_the_original_pbf_and_writes_a_new_release_without_cloud_settings() {
     let work = common::work("pipeline-rebuild-");
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = work.path();
+    fs::create_dir(root.join("config")).unwrap();
+    fs::write(
+        root.join("config/regions.json"),
+        r#"{"regions":[{"id":"au-nsw","extract":"australia-oceania/australia/new-south-wales"}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("config/runtime.json"),
+        include_str!("../config/runtime.json"),
+    )
+    .unwrap();
     let source = common::write_pbf(
         work.path(),
         "source",

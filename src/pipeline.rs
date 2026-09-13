@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::{
     build,
     config::{Environment, Runtime},
-    format, incremental, progress,
+    dispatch, format, incremental, progress,
     publish::{ProgressReporter, PublishConfig, Publisher},
     source::{self, Region, ReplicationState},
     storage::{atomic_write, sync_directory},
@@ -365,6 +365,7 @@ struct Operations<'a> {
     downloader: Downloader,
     catalog: PathBuf,
     publisher: Option<Publisher>,
+    lease: Option<&'a dispatch::Guard>,
     prefetch: Option<Prefetch>,
 }
 
@@ -653,9 +654,13 @@ impl RegionalOperations for Operations<'_> {
         status(entry, data, self.runtime)
     }
     fn publish(&mut self, output: &Path) -> Result<()> {
+        let lease = self
+            .lease
+            .context("Publication requires a claimed task")?
+            .lease()?;
         let mut reporter = ProgressReporter::default();
         self.publisher()?
-            .publish(output, |event| reporter.update(event))?;
+            .publish(output, &lease, |event| reporter.update(event))?;
         Ok(())
     }
     fn published_regions(&mut self) -> Result<BTreeMap<String, String>> {
@@ -923,6 +928,126 @@ fn execute_regions(
     Ok(())
 }
 
+pub fn submit(
+    root: &Path,
+    runtime: &Runtime,
+    environment: &Environment,
+    mode: &str,
+    selection: &str,
+) -> Result<String> {
+    let entries = source::regions(&root.join("config/regions.json"))?
+        .into_iter()
+        .filter(|entry| selection == "all" || entry.id == selection)
+        .collect::<Vec<_>>();
+    ensure!(!entries.is_empty(), "Region is not configured: {selection}");
+    Publisher::new(runtime, &PublishConfig::from_environment(environment)?)?
+        .coordinator()
+        .start(mode, &entries)
+}
+
+pub fn work(
+    root: &Path,
+    runtime: &Runtime,
+    environment: &Environment,
+    once: bool,
+    cleanup: bool,
+) -> Result<()> {
+    let data = &runtime.data_dir;
+    fs::create_dir_all(data)?;
+    let device = dispatch::device_id(data)?;
+    let publisher = Publisher::new(runtime, &PublishConfig::from_environment(environment)?)?;
+    let client = publisher.coordinator();
+    let scratch = root.join(".build/tools/tmp");
+    fs::create_dir_all(&scratch)?;
+    println!("Device {device}: waiting for regional tasks");
+    let mut failures = 0;
+    loop {
+        let local_regions = fs::read_dir(data)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                (format::is_region(&name) && entry.path().join("state.sqlite").is_file())
+                    .then_some(name)
+            })
+            .collect::<Vec<_>>();
+        let claim = client.claim(&device, &local_regions)?;
+        let Some(lease) = claim.lease else {
+            if once && claim.pending == 0 && claim.running == 0 {
+                ensure!(
+                    claim.failed == 0 && failures == 0,
+                    "Batch has {} failed regions and {failures} local failures; inspect osm jobs and submit a retry batch",
+                    claim.failed
+                );
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_secs(claim.retry_after_seconds.clamp(1, 60)));
+            continue;
+        };
+        let entry = Region {
+            id: lease.region.clone(),
+            extract: lease.extract.clone(),
+        };
+        println!("[{}] Claimed generation {}", entry.id, lease.generation);
+        let guard = dispatch::Guard::start(client.clone(), lease.clone())?;
+        let result = (|| -> Result<()> {
+            let catalog = tempfile::Builder::new()
+                .prefix("catalog-")
+                .tempdir_in(&scratch)?;
+            let mut operations = Operations {
+                runtime,
+                environment,
+                scratch: &scratch,
+                downloader: Downloader::new(runtime)?,
+                catalog: catalog.path().join("index.json"),
+                publisher: None,
+                lease: Some(&guard),
+                prefetch: None,
+            };
+            let marker = data.join(format!(".cleanup-{}.json", entry.id));
+            if marker.try_exists()? || is_symlink(&marker)? {
+                ensure!(
+                    cleanup,
+                    "Region cleanup is incomplete; resume work with --cleanup"
+                );
+                let published = operations.published_regions()?;
+                resume_cleanup(
+                    &entry,
+                    data,
+                    published
+                        .get(&entry.id)
+                        .context("Cleanup record has no published region")?,
+                )?;
+            }
+            operations.downloader.download(
+                runtime,
+                INDEX_URL,
+                &operations.catalog,
+                Some(64 * 1024 * 1024),
+            )?;
+            guard.lease()?;
+            if !data.join(&entry.id).try_exists()? {
+                operations.initialize(&entry, data, None, None)?;
+            }
+            guard.lease()?;
+            let current = operations.update(&entry, data)?;
+            operations.publish(Path::new(string(&current, "output")?))?;
+            if cleanup {
+                cleanup_region(&entry, data, string(&current, "manifest")?)?;
+            }
+            println!("[{}] Published", entry.id);
+            Ok(())
+        })();
+        drop(guard);
+        if let Err(error) = result {
+            failures += 1;
+            eprintln!("[{}] Failed: {error:#}", entry.id);
+            if let Err(release_error) = client.release(&lease) {
+                eprintln!("[{}] Could not release task: {release_error:#}", entry.id);
+            }
+        }
+    }
+}
+
 pub fn build(
     root: &Path,
     runtime: &Runtime,
@@ -1038,6 +1163,28 @@ pub fn run(
         entries.retain(|entry| entry.id == selection);
     }
     ensure!(!entries.is_empty(), "Region is not configured: {selection}");
+    if command != "init" {
+        let publisher = Publisher::new(runtime, &PublishConfig::from_environment(environment)?)?;
+        if cleanup {
+            for entry in &entries {
+                let marker = runtime.data_dir.join(format!(".cleanup-{}.json", entry.id));
+                if marker.try_exists()? || is_symlink(&marker)? {
+                    let current = publisher
+                        .read_state()?
+                        .context("Cleanup record has no published state")?;
+                    let release = current
+                        .regions
+                        .iter()
+                        .find(|region| region.region == entry.id)
+                        .context("Cleanup record has no published region")?;
+                    resume_cleanup(entry, &runtime.data_dir, &release.manifest)?;
+                }
+            }
+        }
+        let batch = publisher.coordinator().start(command, &entries)?;
+        println!("Submitted batch: {batch}");
+        return work(root, runtime, environment, true, cleanup);
+    }
     let data = &runtime.data_dir;
     if cleanup {
         reject_symlinks(&[data])?;
@@ -1056,6 +1203,7 @@ pub fn run(
         downloader: Downloader::new(runtime)?,
         catalog: work.path().join("index.json"),
         publisher: None,
+        lease: None,
         prefetch: None,
     };
     if cleanup {
@@ -1132,6 +1280,7 @@ mod tests {
             downloader: Downloader::new(&settings).unwrap(),
             catalog: work.path().join("unused-catalog"),
             publisher: None,
+            lease: None,
             prefetch: None,
         };
         disk_check(work.path(), 0).unwrap();
@@ -1791,6 +1940,7 @@ mod tests {
             downloader: Downloader::new(&settings).unwrap(),
             catalog: work.path().join("unused-catalog"),
             publisher: None,
+            lease: None,
             prefetch: Some(prefetch),
         };
         operations.start_prefetch(Some(&entry("italy")), work.path());
@@ -1846,6 +1996,7 @@ mod tests {
             downloader: Downloader::new(&settings).unwrap(),
             catalog: work.path().join("unused-catalog"),
             publisher: None,
+            lease: None,
             prefetch: Some(Prefetch {
                 region: "germany".into(),
                 control: Arc::new(DownloadControl::default()),

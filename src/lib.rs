@@ -1,6 +1,7 @@
 pub mod build;
 mod compute;
 pub mod config;
+pub mod dispatch;
 pub mod format;
 pub mod incremental;
 pub mod pipeline;

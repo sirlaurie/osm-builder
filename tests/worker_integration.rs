@@ -191,8 +191,14 @@ fn rust_init_publish_query_update_reuse_cleanup_preserves_cloud_data() {
         "uncovered"
     );
     let mut verified_unpublished = false;
+    let dispatch = publisher.coordinator();
+    dispatch
+        .start("bootstrap", std::slice::from_ref(&entry))
+        .unwrap();
+    let device = aura_osm::dispatch::device_id(&data).unwrap();
+    let first_lease = dispatch.claim(&device, &[]).unwrap().lease.unwrap();
     let first = publisher
-        .publish(&output, |event| {
+        .publish(&output, &first_lease, |event| {
             if event.stage == "publish" {
                 assert_eq!(
                     query(&client, &endpoints.worker, None)["coverage"],
@@ -249,7 +255,13 @@ fn rust_init_publish_query_update_reuse_cleanup_preserves_cloud_data() {
     assert_eq!(updated["affectedObjects"], 5);
     assert_eq!(updated["count"], 4);
     let updated_output = PathBuf::from(updated["output"].as_str().unwrap());
-    let uploaded = publisher.publish(&updated_output, |_| {}).unwrap();
+    dispatch
+        .start("update", std::slice::from_ref(&entry))
+        .unwrap();
+    let update_lease = dispatch.claim(&device, &[]).unwrap().lease.unwrap();
+    let uploaded = publisher
+        .publish(&updated_output, &update_lease, |_| {})
+        .unwrap();
     assert!(uploaded["uploaded"].as_u64().unwrap() > 0);
     let result = query(&client, &endpoints.worker, None);
     assert_eq!(
@@ -259,7 +271,9 @@ fn rust_init_publish_query_update_reuse_cleanup_preserves_cloud_data() {
     );
     assert_eq!(result["revision"], uploaded["revision"]);
     assert!(object_keys(&client, &endpoints.worker).contains(&first_manifest));
-    let resumed = publisher.publish(&updated_output, |_| {}).unwrap();
+    let resumed = publisher
+        .publish(&updated_output, &update_lease, |_| {})
+        .unwrap();
     assert_eq!(resumed["uploaded"], 0);
     assert!(resumed["reused"].as_u64().unwrap() > 0);
     let confirmed = publisher.read_state().unwrap().unwrap();

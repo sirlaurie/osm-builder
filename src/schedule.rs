@@ -40,6 +40,7 @@ pub fn job_definition(root: &Path, runtime: &Runtime) -> Result<Value> {
             text(root.clone())?,
             Value::String("update".into()),
             Value::String("all".into()),
+            Value::String("--submit-only".into()),
         ]),
     );
     definition.insert("WorkingDirectory".into(), text(root.clone())?);
@@ -143,7 +144,7 @@ mod tests {
         assert!(!definition.contains_key("EnvironmentVariables"));
         assert!(!definition.contains_key("KeepAlive"));
         let arguments = definition["ProgramArguments"].as_array().unwrap();
-        assert_eq!(arguments.len(), 5);
+        assert_eq!(arguments.len(), 6);
         assert_eq!(
             arguments[0].as_string(),
             std::env::current_exe()
@@ -159,6 +160,7 @@ mod tests {
         );
         assert_eq!(arguments[3].as_string(), Some("update"));
         assert_eq!(arguments[4].as_string(), Some("all"));
+        assert_eq!(arguments[5].as_string(), Some("--submit-only"));
         assert_eq!(definition["Umask"].as_unsigned_integer(), Some(0o077));
         let mut encoded = Vec::new();
         Value::Dictionary(definition.clone())
