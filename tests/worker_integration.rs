@@ -183,6 +183,16 @@ fn rust_init_publish_query_update_reuse_cleanup_preserves_cloud_data() {
     assert_eq!(initial["count"], 3);
     assert_eq!(initial["excludedIncompleteRelationCount"], 1);
     let output = PathBuf::from(initial["output"].as_str().unwrap());
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(output.join(format!(
+            "manifests/{}.json",
+            initial["manifest"].as_str().unwrap()
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["schema"], 2);
+    assert!(!manifest["packs"].as_array().unwrap().is_empty());
     let exclusions = fs::read_to_string(output.join("excluded-relations.jsonl")).unwrap();
     let excluded: Value = serde_json::from_str(exclusions.lines().next().unwrap()).unwrap();
     assert_eq!(excluded["id"], "osm_relation_306382");
@@ -233,6 +243,12 @@ fn rust_init_publish_query_update_reuse_cleanup_preserves_cloud_data() {
     );
     let first_manifest = format!("manifests/{}.json", first["manifest"].as_str().unwrap());
     let first_objects = object_keys(&client, &endpoints.worker);
+    assert!(first_objects.iter().any(|key| key.starts_with("packs/")));
+    assert!(
+        first_objects
+            .iter()
+            .all(|key| key.starts_with("packs/") || key.starts_with("manifests/"))
+    );
 
     let change = work.path().join("change.osc.gz");
     let mut compressed = GzEncoder::new(Vec::new(), Compression::default());

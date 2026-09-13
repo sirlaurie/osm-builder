@@ -96,11 +96,22 @@ impl Fixture {
         let manifest: Value = serde_json::from_slice(&bytes).unwrap();
         let mut records = BTreeMap::new();
         for hashes in manifest["cells"].as_object().unwrap().values() {
-            for digest in hashes.as_array().unwrap() {
-                let digest = digest.as_str().unwrap();
-                let bytes = fs::read(output.join(format!("blocks/{digest}.json"))).unwrap();
-                assert_eq!(hash_bytes(&bytes), digest);
-                for record in serde_json::from_slice::<Vec<Value>>(&bytes).unwrap() {
+            for page in hashes.as_array().unwrap() {
+                let digest = page[0].as_str().unwrap();
+                let pack = manifest["packs"][page[1].as_u64().unwrap() as usize]
+                    .as_str()
+                    .unwrap();
+                let packed = fs::read(output.join(format!("packs/{pack}.bin"))).unwrap();
+                assert_eq!(hash_bytes(&packed), pack);
+                let offset = page[2].as_u64().unwrap() as usize;
+                let length = page[3].as_u64().unwrap() as usize;
+                let bytes = &packed[offset..offset + length];
+                assert_eq!(
+                    bytes,
+                    fs::read(output.join(format!("blocks/{digest}.json"))).unwrap()
+                );
+                assert_eq!(hash_bytes(bytes), digest);
+                for record in serde_json::from_slice::<Vec<Value>>(bytes).unwrap() {
                     assert!(
                         records
                             .insert(record["id"].as_str().unwrap().into(), record)
@@ -110,12 +121,227 @@ impl Fixture {
             }
         }
         assert_eq!(records.len() as u64, manifest["count"].as_u64().unwrap());
+        aura_osm::format::validate_manifest(&manifest).unwrap();
         (manifest, records)
     }
 
     fn database(&self) -> Connection {
         Connection::open(self.state.join("state.sqlite")).unwrap()
     }
+
+    fn legacy_state(&self) -> (Value, Value) {
+        let (packed, _) = self.snapshot();
+        let mut legacy = packed.clone();
+        legacy["schema"] = json!(1);
+        legacy.as_object_mut().unwrap().remove("packs");
+        for pages in legacy["cells"].as_object_mut().unwrap().values_mut() {
+            *pages = json!(
+                pages
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|page| page[0].clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+        let digest = aura_osm::storage::write_object(
+            &self.state.join("output"),
+            "manifests",
+            &aura_osm::format::canonical_json(&legacy).unwrap(),
+        )
+        .unwrap();
+        let connection = self.database();
+        let stored: String = connection
+            .query_row("SELECT receipt FROM control WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut receipt: Value = serde_json::from_str(&stored).unwrap();
+        receipt["manifest"] = json!(digest);
+        for field in ["blockCount", "packCount", "packBytes"] {
+            receipt.as_object_mut().unwrap().remove(field);
+        }
+        connection
+            .execute(
+                "UPDATE control SET receipt=? WHERE id=1",
+                [serde_json::to_string(&receipt).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX cell_blocks_group; DROP TABLE packed_groups; PRAGMA user_version=1;",
+            )
+            .unwrap();
+        fs::write(
+            self.state.join("output/release.json"),
+            aura_osm::format::canonical_json(&receipt).unwrap(),
+        )
+        .unwrap();
+        (packed, receipt)
+    }
+}
+
+#[test]
+fn legacy_status_upgrades_packing_without_a_pbf_and_recovers_the_committed_export() {
+    let fixture = Fixture::new();
+    let (packed, legacy_receipt) = fixture.legacy_state();
+    fs::write(
+        &fixture.init.input,
+        b"PBF is not available during index migration",
+    )
+    .unwrap();
+    let upgraded = fixture.status();
+    let (manifest, records) = fixture.snapshot();
+    assert_eq!(manifest, packed);
+    assert_eq!(upgraded["sequence"], 10);
+    assert_eq!(records.len(), 4);
+    assert_eq!(
+        fixture
+            .database()
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    fs::write(
+        fixture.state.join("output/release.json"),
+        serde_json::to_vec(&legacy_receipt).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fixture.status()["manifest"], upgraded["manifest"]);
+    let restored: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("output/release.json")).unwrap())
+            .unwrap();
+    assert_eq!(restored["manifest"], upgraded["manifest"]);
+}
+
+#[test]
+fn failed_pack_migration_rolls_back_schema_and_preserves_the_published_local_receipt() {
+    let fixture = Fixture::new();
+    let (packed, legacy_receipt) = fixture.legacy_state();
+    let hash = packed["cells"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()[0][0]
+        .as_str()
+        .unwrap();
+    let block = fixture.state.join(format!("output/blocks/{hash}.json"));
+    let bytes = fs::read(&block).unwrap();
+    fs::write(&block, b"corrupt block").unwrap();
+    assert!(incremental::status(&fixture.state, &fixture.compute).is_err());
+    let connection = fixture.database();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='packed_groups'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let release: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("output/release.json")).unwrap())
+            .unwrap();
+    assert_eq!(release, legacy_receipt);
+    fs::write(block, bytes).unwrap();
+    assert_eq!(fixture.snapshot().0, packed);
+}
+
+#[test]
+fn applying_a_diff_upgrades_legacy_packing_in_the_same_transaction() {
+    let fixture = Fixture::new();
+    fixture.legacy_state();
+    let changed = fixture.change("", 11).unwrap();
+    assert_eq!(changed["sequence"], 11);
+    assert_eq!(fixture.snapshot().0["schema"], 2);
+    assert_eq!(
+        fixture
+            .database()
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn pending_cleanup_preserves_legacy_receipt_and_blocks_status_and_diff_migration() {
+    let fixture = Fixture::new();
+    let (_, legacy_receipt) = fixture.legacy_state();
+    let marker = fixture.work.path().join(".cleanup-au-nsw.json");
+    let record = serde_json::to_vec(
+        &json!({"region":"au-nsw", "manifest":legacy_receipt["manifest"], "downloads":[]}),
+    )
+    .unwrap();
+    fs::write(&marker, &record).unwrap();
+    let release_path = fixture.state.join("output/release.json");
+    let release = fs::read(&release_path).unwrap();
+    for error in [
+        incremental::status(&fixture.state, &fixture.compute).unwrap_err(),
+        fixture.change("", 11).unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("resume work --cleanup"));
+    }
+    assert_eq!(fs::read(marker).unwrap(), record);
+    assert_eq!(fs::read(release_path).unwrap(), release);
+    let connection = fixture.database();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='packed_groups'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn dirty_group_repacking_leaves_other_groups_untouched_and_removes_empty_groups() {
+    let fixture = Fixture::new();
+    let connection = fixture.database();
+    let groups = |connection: &Connection| {
+        connection
+            .prepare("SELECT group_id,block_references FROM packed_groups ORDER BY group_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+            .unwrap()
+    };
+    let before = groups(&connection);
+    let target = "346_2065";
+    assert!(before.contains_key(target));
+    connection.execute_batch(&format!("CREATE TRIGGER protect_other_groups BEFORE DELETE ON packed_groups WHEN OLD.group_id!='{target}' BEGIN SELECT RAISE(ABORT,'unrelated group was repacked'); END;")).unwrap();
+    fixture.change(r#"<modify><node id="50" version="2" lat="-34.5" lon="150.5"><tag k="name" v="Renamed Shop"/><tag k="shop" v="books"/></node></modify>"#, 11).unwrap();
+    let after = groups(&connection);
+    assert_ne!(before[target], after[target]);
+    for (group, references) in &before {
+        if group != target {
+            assert_eq!(&after[group], references);
+        }
+    }
+    fixture
+        .change(r#"<delete><node id="50" version="3"/></delete>"#, 12)
+        .unwrap();
+    assert!(!groups(&connection).contains_key(target));
+    assert!(!fixture.snapshot().1.contains_key("osm_node_50"));
 }
 
 #[test]
@@ -162,7 +388,7 @@ fn node_move_propagates_to_parents_and_preserves_unaffected_block_files() {
         .iter()
         .find(|(_, hashes)| {
             hashes.as_array().unwrap().iter().any(|hash| {
-                fs::read_to_string(block_dir.join(format!("{}.json", hash.as_str().unwrap())))
+                fs::read_to_string(block_dir.join(format!("{}.json", hash[0].as_str().unwrap())))
                     .unwrap()
                     .contains("osm_node_50")
             })
@@ -175,7 +401,7 @@ fn node_move_propagates_to_parents_and_preserves_unaffected_block_files() {
         .unwrap()
         .iter()
         .map(|hash| {
-            let path = block_dir.join(format!("{}.json", hash.as_str().unwrap()));
+            let path = block_dir.join(format!("{}.json", hash[0].as_str().unwrap()));
             let modified = fs::metadata(&path).unwrap().modified().unwrap();
             (path, modified)
         })
@@ -187,7 +413,22 @@ fn node_move_propagates_to_parents_and_preserves_unaffected_block_files() {
     assert_eq!(pois["osm_way_10"]["lat"], (-33.5 - 33.8) / 2.0);
     assert_eq!(pois["osm_relation_20"]["lon"], (151.5 + 151.2) / 2.0);
     assert_eq!(pois["osm_node_50"], before_pois["osm_node_50"]);
-    assert_eq!(before["cells"][&stable_cell], after["cells"][&stable_cell]);
+    let references = |manifest: &Value| {
+        manifest["cells"][&stable_cell]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|page| {
+                json!([
+                    page[0],
+                    manifest["packs"][page[1].as_u64().unwrap() as usize],
+                    page[2],
+                    page[3]
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(references(&before), references(&after));
     for (path, modified) in stable_files {
         assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
     }
@@ -533,6 +774,24 @@ fn installed_version_one_state_from_previous_engine_can_be_read_and_updated() {
     database
         .execute_batch(include_str!("fixtures/installed-state-v1.sql"))
         .unwrap();
+    let payload: Vec<u8> = database
+        .query_row(
+            "SELECT payload FROM pois WHERE id='osm_node_1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut block = vec![b'['];
+    block.extend_from_slice(&payload);
+    block.push(b']');
+    let digest = aura_osm::storage::write_object(&state.join("output"), "blocks", &block).unwrap();
+    let hashes: String = database
+        .query_row("SELECT hashes FROM cell_blocks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&hashes).unwrap(),
+        [digest]
+    );
     database.close().unwrap();
     let compute = ComputeOptions {
         workers: 2,
@@ -569,7 +828,7 @@ fn installed_version_one_state_from_previous_engine_can_be_read_and_updated() {
     .unwrap();
     let cells = manifest["cells"].as_object().unwrap();
     assert_eq!(cells.len(), 1);
-    let digest = cells.values().next().unwrap()[0].as_str().unwrap();
+    let digest = cells.values().next().unwrap()[0][0].as_str().unwrap();
     let records: Value = serde_json::from_slice(
         &fs::read(state.join(format!("output/blocks/{digest}.json"))).unwrap(),
     )

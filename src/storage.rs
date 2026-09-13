@@ -66,7 +66,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub fn write_object(output: &Path, directory: &str, payload: &[u8]) -> Result<String> {
     ensure!(
-        matches!(directory, "blocks" | "manifests"),
+        matches!(directory, "blocks" | "manifests" | "packs"),
         "Invalid immutable object directory"
     );
     let folder = output.join(directory);
@@ -82,21 +82,18 @@ pub fn write_object(output: &Path, directory: &str, payload: &[u8]) -> Result<St
         Err(error) => return Err(error.into()),
     }
     let hash = hash_bytes(payload);
-    let path = folder.join(format!("{hash}.json"));
+    let extension = if directory == "packs" { "bin" } else { "json" };
+    let key = format!("{directory}/{hash}.{extension}");
+    let path = output.join(&key);
     match fs::symlink_metadata(&path) {
         Ok(metadata) => {
             ensure!(
                 metadata.is_file() && !metadata.is_symlink(),
                 "Immutable object is not a regular file"
             );
-            let object = read_local(
-                output,
-                &format!("{directory}/{hash}.json"),
-                payload.len(),
-                Some(&hash),
-            )?;
+            let (bytes, _) = read_bytes(output, &key, payload.len(), Some(&hash))?;
             ensure!(
-                object.bytes == payload,
+                bytes == payload,
                 "Existing content-addressed object is corrupt"
             );
         }
@@ -112,6 +109,24 @@ pub fn read_local(
     limit: usize,
     expected_hash: Option<&str>,
 ) -> Result<LocalObject> {
+    let (bytes, hash) = read_bytes(root, key, limit, expected_hash)?;
+    let value =
+        serde_json::from_slice(&bytes).with_context(|| format!("Invalid UTF-8 JSON: {key}"))?;
+    Ok(LocalObject {
+        key: key.to_owned(),
+        hash,
+        size: bytes.len(),
+        bytes,
+        value,
+    })
+}
+
+pub fn read_bytes(
+    root: &Path,
+    key: &str,
+    limit: usize,
+    expected_hash: Option<&str>,
+) -> Result<(Vec<u8>, String)> {
     let root = root.canonicalize().context("Cannot open build directory")?;
     let path = root.join(key);
     let actual = path
@@ -140,13 +155,5 @@ pub fn read_local(
         expected_hash.is_none_or(|expected| expected == hash),
         "SHA-256 mismatch: {key}"
     );
-    let value =
-        serde_json::from_slice(&bytes).with_context(|| format!("Invalid UTF-8 JSON: {key}"))?;
-    Ok(LocalObject {
-        key: key.to_owned(),
-        hash,
-        size,
-        bytes,
-        value,
-    })
+    Ok((bytes, hash))
 }

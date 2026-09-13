@@ -1,8 +1,8 @@
 use aura_osm::format::{
-    canonical_json, has_name, is_poi, normalize_timestamp, source_metadata, validate_block,
-    validate_coverage, validate_current, validate_manifest,
+    MAX_BLOCK, MAX_PACK, canonical_json, has_name, is_poi, normalize_timestamp, source_metadata,
+    validate_block, validate_coverage, validate_current, validate_manifest,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, path::Path};
 
 #[test]
@@ -87,6 +87,133 @@ fn format_trust_boundaries_preserve_worker_constraints() {
     let mut invalid = valid;
     invalid[0]["id"] = json!("osm_node_9007199254740992");
     assert!(validate_block(&invalid).is_err());
+}
+
+fn packed_manifest() -> Value {
+    let hashes = ['a', 'b', 'c', 'd', 'e'].map(|letter| letter.to_string().repeat(64));
+    let pages: Vec<_> = hashes
+        .iter()
+        .enumerate()
+        .map(|(index, hash)| {
+            if index < 4 {
+                json!([hash, 0, index * MAX_BLOCK, MAX_BLOCK])
+            } else {
+                json!([hash, 1, 0, 2])
+            }
+        })
+        .collect();
+    json!({"schema":2,"region":"test","sourceTimestamp":"2026-01-01T00:00:00Z",
+        "sourceSequence":null,"sourceSHA256":"a".repeat(64),
+        "coverage":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]},
+        "cells":{"9000_18000":pages},"packs":["1".repeat(64),"2".repeat(64)],"count":5})
+}
+
+#[test]
+fn packed_manifest_requires_exact_references_and_contiguous_bounded_slices() {
+    let manifest = packed_manifest();
+    let parsed = validate_manifest(&manifest).unwrap();
+    assert_eq!(parsed.cells["9000_18000"][3].hash(), "d".repeat(64));
+    assert_eq!(
+        manifest["cells"]["9000_18000"][3][2].as_u64().unwrap() as usize + MAX_BLOCK,
+        MAX_PACK
+    );
+    assert_eq!(serde_json::to_value(parsed).unwrap(), manifest);
+
+    for (page, field, replacement) in [
+        (0, 0, json!("bad")),
+        (0, 1, json!(2)),
+        (0, 1, json!(-1)),
+        (0, 1, json!(0.5)),
+        (0, 1, json!(9_007_199_254_740_992_u64)),
+        (0, 2, json!(1)),
+        (0, 2, json!(-1)),
+        (0, 2, json!(0.5)),
+        (0, 2, json!(9_007_199_254_740_992_u64)),
+        (0, 2, json!(u64::MAX)),
+        (0, 3, json!(0)),
+        (0, 3, json!(-1)),
+        (0, 3, json!(1.5)),
+        (0, 3, json!(MAX_BLOCK - 1)),
+        (0, 3, json!(MAX_BLOCK + 1)),
+        (3, 2, json!(MAX_PACK - MAX_BLOCK - 1)),
+        (3, 2, json!(MAX_PACK - MAX_BLOCK + 1)),
+        (3, 2, json!(MAX_PACK)),
+    ] {
+        let mut invalid = manifest.clone();
+        invalid["cells"]["9000_18000"][page][field] = replacement.clone();
+        assert!(
+            validate_manifest(&invalid).is_err(),
+            "{page}/{field}: {replacement}"
+        );
+    }
+    let mut missing = manifest.clone();
+    missing["packs"].as_array_mut().unwrap().pop();
+    assert!(validate_manifest(&missing).is_err());
+
+    let mut extra = manifest.clone();
+    extra["packs"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("3".repeat(64)));
+    assert!(validate_manifest(&extra).is_err());
+
+    for packs in [
+        json!(["../pack", "2".repeat(64)]),
+        json!(["1".repeat(64), "1".repeat(64)]),
+        json!(["2".repeat(64), "1".repeat(64)]),
+    ] {
+        let mut invalid = manifest.clone();
+        invalid["packs"] = packs;
+        assert!(validate_manifest(&invalid).is_err());
+    }
+    let mut duplicate = manifest.clone();
+    duplicate["cells"]["9000_18001"] = json!([["a".repeat(64), 1, 2, 2]]);
+    assert!(validate_manifest(&duplicate).is_err());
+    for page in [
+        json!("a".repeat(64)),
+        json!(["a".repeat(64), 0, 0]),
+        json!(["a".repeat(64), 0, 0, 2, 3]),
+    ] {
+        let mut invalid = manifest.clone();
+        invalid["cells"]["9000_18000"][0] = page;
+        assert!(validate_manifest(&invalid).is_err());
+    }
+}
+
+#[test]
+fn manifest_versions_preserve_legacy_reads_and_require_schema_two_packs() {
+    let mut legacy = packed_manifest();
+    legacy["schema"] = json!(1);
+    assert!(validate_manifest(&legacy).is_err());
+    legacy.as_object_mut().unwrap().remove("packs");
+    assert!(validate_manifest(&legacy).is_err());
+    for page in legacy["cells"]["9000_18000"].as_array_mut().unwrap() {
+        *page = page[0].clone();
+    }
+    assert!(validate_manifest(&legacy).unwrap().packs.is_empty());
+    legacy["packs"] = json!(["1".repeat(64)]);
+    assert!(validate_manifest(&legacy).is_err());
+    legacy["packs"] = json!([]);
+    validate_manifest(&legacy).unwrap();
+
+    let mut empty = packed_manifest();
+    empty["cells"] = json!({});
+    empty["count"] = json!(0);
+    assert!(validate_manifest(&empty).is_err());
+    empty["packs"] = json!([]);
+    let parsed = validate_manifest(&empty).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap()["packs"], json!([]));
+    for packs in [Value::Null, json!({}), json!(false)] {
+        let mut invalid = empty.clone();
+        invalid["packs"] = packs;
+        assert!(validate_manifest(&invalid).is_err());
+    }
+    empty.as_object_mut().unwrap().remove("packs");
+    assert!(validate_manifest(&empty).is_err());
+    for schema in [0, 3] {
+        legacy["schema"] = json!(schema);
+        assert!(validate_manifest(&legacy).is_err());
+    }
 }
 
 #[test]

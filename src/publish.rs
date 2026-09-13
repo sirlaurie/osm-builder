@@ -1,8 +1,10 @@
 use crate::config::{Environment, Runtime};
 use crate::dispatch::{self, Lease};
-use crate::format::{self, Current, MAX_BLOCK, MAX_CURRENT, MAX_MANIFEST, Release};
+use crate::format::{
+    self, CellPage, Current, MAX_BLOCK, MAX_CURRENT, MAX_MANIFEST, MAX_PACK, Release,
+};
 use crate::progress::ProgressLine;
-use crate::storage::{atomic_write, read_local};
+use crate::storage::{atomic_write, read_bytes, read_local};
 use anyhow::{Result, anyhow, bail, ensure};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -14,7 +16,7 @@ use reqwest::blocking::{Client, Response};
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -135,6 +137,18 @@ struct Build {
     objects: Vec<Object>,
 }
 
+struct BlockSlice<'a> {
+    hash: &'a str,
+    cell: &'a str,
+    range: Option<(usize, usize)>,
+}
+
+struct ObjectSlices<'a> {
+    hash: &'a str,
+    maximum: usize,
+    blocks: Vec<BlockSlice<'a>>,
+}
+
 fn validate_build(
     directory: &Path,
     cancelled: &AtomicBool,
@@ -154,24 +168,86 @@ fn validate_build(
             && manifest.count == release.count,
         "Release does not match manifest"
     );
-    let total = manifest.cells.values().map(Vec::len).sum::<usize>() + 1;
+    let mut groups: BTreeMap<String, ObjectSlices<'_>> = BTreeMap::new();
+    let mut hashes = HashSet::new();
+    for (cell, pages) in &manifest.cells {
+        for page in pages {
+            ensure!(
+                hashes.insert(page.hash()),
+                "Repeated block reference: {cell}"
+            );
+            let (key, hash, maximum, range) = match page {
+                CellPage::Legacy(hash) => (
+                    format!("blocks/{hash}.json"),
+                    hash.as_str(),
+                    MAX_BLOCK,
+                    None,
+                ),
+                CellPage::Packed((_, index, offset, length)) => {
+                    let hash = &manifest.packs[*index];
+                    (
+                        format!("packs/{hash}.bin"),
+                        hash.as_str(),
+                        MAX_PACK,
+                        Some((*offset, *length)),
+                    )
+                }
+            };
+            groups
+                .entry(key)
+                .or_insert_with(|| ObjectSlices {
+                    hash,
+                    maximum,
+                    blocks: Vec::new(),
+                })
+                .blocks
+                .push(BlockSlice {
+                    hash: page.hash(),
+                    cell,
+                    range,
+                });
+        }
+    }
+    let total = groups.len() + 1;
     progress(Progress {
         completed: Some(0),
         total: Some(total),
         ..Progress::stage("validate")
     });
     let mut objects = Vec::with_capacity(total);
-    let mut hashes = HashSet::new();
     let mut ids = HashSet::new();
-    for (cell, pages) in &manifest.cells {
-        let mut previous_id = String::new();
-        for hash in pages {
+    let mut boundaries = HashMap::new();
+    for (key, group) in groups {
+        ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
+        let (bytes, hash) = read_bytes(&root, &key, group.maximum, Some(group.hash))?;
+        if manifest.schema == 2 {
+            ensure!(
+                group
+                    .blocks
+                    .iter()
+                    .filter_map(|block| block.range.map(|(offset, length)| offset + length))
+                    .max()
+                    == Some(bytes.len()),
+                "Pack size does not match manifest: {key}"
+            );
+        }
+        for block in group.blocks {
             ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
-            ensure!(hashes.insert(hash), "Repeated block reference: {cell}");
-            let key = format!("blocks/{hash}.json");
-            let block = read_local(&root, &key, MAX_BLOCK, Some(hash))?;
-            let pois = format::validate_block(&block.value)?;
-            ensure!(!pois.is_empty(), "Empty block: {hash}");
+            let payload = match block.range {
+                Some((offset, length)) => bytes
+                    .get(offset..offset + length)
+                    .ok_or_else(|| anyhow!("Block range exceeds pack: {key}"))?,
+                None => bytes.as_slice(),
+            };
+            ensure!(
+                format::hash_bytes(payload) == block.hash,
+                "SHA-256 mismatch: {}",
+                block.hash
+            );
+            let pois = format::validate_block(&serde_json::from_slice(payload)?)?;
+            ensure!(!pois.is_empty(), "Empty block: {}", block.hash);
+            let first_id = pois[0].id.clone();
+            let mut previous_id = String::new();
             for poi in pois {
                 let id = poi
                     .id
@@ -180,7 +256,8 @@ fn validate_build(
                     .and_then(|id| id.parse::<u64>().ok());
                 ensure!(
                     id.is_some_and(|id| id <= format::MAX_ID) && poi.lon < 180.0,
-                    "Invalid POI: {hash}"
+                    "Invalid POI: {}",
+                    block.hash
                 );
                 ensure!(format::has_name(&poi.tags), "Unnamed POI: {}", poi.id);
                 let expected = format!(
@@ -188,7 +265,7 @@ fn validate_build(
                     ((poi.lat + 90.0) * 100.0).floor().min(17999.0) as u32,
                     ((poi.lon + 180.0) * 100.0).floor() as u32
                 );
-                ensure!(&expected == cell, "POI in wrong cell: {}", poi.id);
+                ensure!(expected == block.cell, "POI in wrong cell: {}", poi.id);
                 ensure!(
                     poi.id > previous_id && ids.insert(poi.id.clone()),
                     "Duplicate or unsorted POI: {}",
@@ -196,16 +273,25 @@ fn validate_build(
                 );
                 previous_id = poi.id;
             }
-            objects.push(Object {
-                key,
-                hash: hash.clone(),
-                size: block.size,
-            });
-            progress(Progress {
-                completed: Some(objects.len()),
-                total: Some(total),
-                ..Progress::stage("validate")
-            });
+            boundaries.insert(block.hash, (first_id, previous_id));
+        }
+        objects.push(Object {
+            key,
+            hash,
+            size: bytes.len(),
+        });
+        progress(Progress {
+            completed: Some(objects.len()),
+            total: Some(total),
+            ..Progress::stage("validate")
+        });
+    }
+    for pages in manifest.cells.values() {
+        for pair in pages.windows(2) {
+            ensure!(
+                boundaries[pair[0].hash()].1 < boundaries[pair[1].hash()].0,
+                "Duplicate or unsorted POI pages"
+            );
         }
     }
     ensure!(
@@ -370,7 +456,14 @@ impl Publisher {
             let mut headers = HeaderMap::new();
             if let Some(bytes) = body {
                 headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
-                headers.insert("content-type", HeaderValue::from_static("application/json"));
+                headers.insert(
+                    "content-type",
+                    HeaderValue::from_static(if object.key.starts_with("packs/") {
+                        "application/octet-stream"
+                    } else {
+                        "application/json"
+                    }),
+                );
                 headers.insert(
                     "cache-control",
                     HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -479,9 +572,9 @@ impl Publisher {
             return Ok(false);
         }
         ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
-        let local = read_local(root, &object.key, object.size, Some(&object.hash))?;
+        let (bytes, _) = read_bytes(root, &object.key, object.size, Some(&object.hash))?;
         let response = self
-            .s3_request(Method::PUT, object, Some(&local.bytes), cancelled)
+            .s3_request(Method::PUT, object, Some(&bytes), cancelled)
             .map_err(|_| anyhow!("R2 upload failed: {}", object.key))?;
         if matches!(
             response.status(),

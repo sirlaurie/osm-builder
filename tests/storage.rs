@@ -1,6 +1,6 @@
 use aura_osm::{
     format::hash_bytes,
-    storage::{atomic_write, read_local, write_object},
+    storage::{atomic_write, read_bytes, read_local, write_object},
 };
 use std::{
     fs,
@@ -16,6 +16,19 @@ fn local_io_preserves_immutable_content_and_refuses_symlink_escape() {
     let output = root.path().join("output");
     fs::create_dir(&output).unwrap();
     let hash = write_object(&output, "blocks", b"[]").unwrap();
+    let pack = b"[][]";
+    let pack_hash = write_object(&output, "packs", pack).unwrap();
+    let pack_key = format!("packs/{pack_hash}.bin");
+    assert_eq!(
+        read_bytes(&output, &pack_key, pack.len(), Some(&pack_hash))
+            .unwrap()
+            .0,
+        pack
+    );
+    assert_eq!(write_object(&output, "packs", pack).unwrap(), pack_hash);
+    assert!(read_local(&output, &pack_key, pack.len(), Some(&pack_hash)).is_err());
+    fs::write(output.join(&pack_key), b"{}{}").unwrap();
+    assert!(write_object(&output, "packs", pack).is_err());
     assert_eq!(hash, hash_bytes(b"[]"));
     assert_eq!(write_object(&output, "blocks", b"[]").unwrap(), hash);
     let key = format!("blocks/{hash}.json");

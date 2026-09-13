@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,9 +11,14 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
 use crate::compute;
-use crate::format::{MAX_BLOCK, MAX_MANIFEST, canonical_json, source_metadata};
+use crate::format::{
+    MAX_BLOCK, MAX_MANIFEST, MAX_PACK, PackedBlock, canonical_json, source_metadata,
+};
 use crate::progress::ProgressLine;
-use crate::storage::{atomic_file, atomic_write, write_object};
+use crate::storage::{atomic_file, atomic_write, read_local, write_object};
+
+const PACK_GROUP_Y: &str = "CAST(substr(cell,1,instr(cell,'_')-1) AS INTEGER)/16";
+const PACK_GROUP_X: &str = "CAST(substr(cell,instr(cell,'_')+1) AS INTEGER)/16";
 
 #[derive(Clone, Debug)]
 pub struct ComputeOptions {
@@ -264,6 +269,15 @@ pub(crate) fn create_output_index(connection: &Connection) -> Result<()> {
             PRIMARY KEY (relation_id, owner, kind, target_id)
          ) WITHOUT ROWID;",
     )?;
+    create_pack_index(connection)?;
+    Ok(())
+}
+
+pub(crate) fn create_pack_index(connection: &Connection) -> Result<()> {
+    connection.execute_batch(&format!(
+        "CREATE TABLE packed_groups (group_id TEXT PRIMARY KEY, block_references TEXT NOT NULL) WITHOUT ROWID;
+         CREATE INDEX cell_blocks_group ON cell_blocks(({PACK_GROUP_Y}),({PACK_GROUP_X}));"
+    ))?;
     Ok(())
 }
 
@@ -668,6 +682,89 @@ pub(crate) fn write_cells(connection: &Connection, output: &Path, dirty_only: bo
         ])?;
     }
     progress.finish();
+    write_packs(connection, output, dirty_only)?;
+    Ok(())
+}
+
+pub(crate) fn write_packs(connection: &Connection, output: &Path, dirty_only: bool) -> Result<()> {
+    let table = if dirty_only {
+        "dirty_cells"
+    } else {
+        "cell_blocks"
+    };
+    let groups = connection
+        .prepare(&format!(
+            "SELECT DISTINCT {PACK_GROUP_Y},{PACK_GROUP_X} FROM {table} ORDER BY 1,2"
+        ))?
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !dirty_only {
+        connection.execute("DELETE FROM packed_groups", [])?;
+    }
+    let mut cells = connection.prepare(&format!(
+        "SELECT hashes FROM cell_blocks WHERE ({PACK_GROUP_Y})=? AND ({PACK_GROUP_X})=? ORDER BY cell"
+    ))?;
+    let mut progress = Progress::new("Spatial POI packs");
+    for (y, x) in groups {
+        let group = format!("{y}_{x}");
+        connection.execute("DELETE FROM packed_groups WHERE group_id=?", [&group])?;
+        let mut references = BTreeMap::<String, PackedBlock>::new();
+        let mut payload = Vec::new();
+        let mut pending = Vec::<(String, usize, usize)>::new();
+        let mut flush =
+            |payload: &mut Vec<u8>, pending: &mut Vec<(String, usize, usize)>| -> Result<()> {
+                if payload.is_empty() {
+                    return Ok(());
+                }
+                let pack = write_object(output, "packs", payload)?;
+                for (hash, offset, length) in pending.drain(..) {
+                    ensure!(
+                        references
+                            .insert(
+                                hash,
+                                PackedBlock {
+                                    pack: pack.clone(),
+                                    offset,
+                                    length
+                                }
+                            )
+                            .is_none(),
+                        "Repeated logical block in spatial pack group"
+                    );
+                }
+                payload.clear();
+                progress.advance(1);
+                Ok(())
+            };
+        let mut rows = cells.query(params![y, x])?;
+        while let Some(row) = rows.next()? {
+            let hashes: Vec<String> = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            for hash in hashes {
+                let block = read_local(
+                    output,
+                    &format!("blocks/{hash}.json"),
+                    MAX_BLOCK,
+                    Some(&hash),
+                )?;
+                if payload.len() + block.bytes.len() > MAX_PACK {
+                    flush(&mut payload, &mut pending)?;
+                }
+                pending.push((hash, payload.len(), block.bytes.len()));
+                payload.extend_from_slice(&block.bytes);
+            }
+        }
+        flush(&mut payload, &mut pending)?;
+        if !references.is_empty() {
+            connection.execute(
+                "INSERT INTO packed_groups VALUES (?,?)",
+                params![
+                    group,
+                    String::from_utf8(canonical_json(&json!(references))?)?
+                ],
+            )?;
+        }
+    }
+    progress.finish();
     Ok(())
 }
 
@@ -678,38 +775,87 @@ pub(crate) fn write_manifest(
     count: u64,
     excluded: u64,
 ) -> Result<Value> {
+    let mut references = BTreeMap::<String, PackedBlock>::new();
+    let mut statement =
+        connection.prepare("SELECT block_references FROM packed_groups ORDER BY group_id")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let group: BTreeMap<String, PackedBlock> = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        for (hash, reference) in group {
+            ensure!(
+                references.insert(hash, reference).is_none(),
+                "Repeated logical block across spatial pack groups"
+            );
+        }
+    }
+    let packs = references
+        .values()
+        .map(|reference| reference.pack.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let pack_indices = packs
+        .iter()
+        .enumerate()
+        .map(|(index, hash)| (hash.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
     let mut manifest = metadata
         .as_object()
         .context("Invalid source metadata")?
         .clone();
-    manifest.insert("schema".to_owned(), json!(1));
+    manifest.insert("schema".to_owned(), json!(2));
     manifest.insert("count".to_owned(), json!(count));
     manifest.insert(
         "excludedIncompleteRelationCount".to_owned(),
         json!(excluded),
     );
     manifest.insert("cells".to_owned(), json!({}));
+    manifest.insert("packs".to_owned(), json!(&packs));
     let mut size = canonical_json(&Value::Object(manifest.clone()))?.len();
     ensure!(
         size <= MAX_MANIFEST,
         "Region manifest exceeds 8 MiB; split the region"
     );
     let mut cells = Map::new();
+    let mut used = BTreeSet::new();
     let mut statement = connection.prepare("SELECT cell,hashes FROM cell_blocks ORDER BY cell")?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let cell: String = row.get(0)?;
-        let hashes: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        let hashes: Vec<String> = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        let pages = hashes
+            .into_iter()
+            .map(|hash| -> Result<Value> {
+                let reference = references
+                    .get(&hash)
+                    .context("Missing packed logical block")?;
+                ensure!(
+                    used.insert(hash.clone()),
+                    "Repeated logical block in region cells"
+                );
+                Ok(json!([
+                    hash,
+                    pack_indices[reference.pack.as_str()],
+                    reference.offset,
+                    reference.length
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let pages = json!(pages);
         size += canonical_json(&json!(&cell))?.len()
             + 1
-            + canonical_json(&hashes)?.len()
+            + canonical_json(&pages)?.len()
             + usize::from(!cells.is_empty());
         ensure!(
             size <= MAX_MANIFEST,
             "Region manifest exceeds 8 MiB; split the region"
         );
-        cells.insert(cell, hashes);
+        cells.insert(cell, pages);
     }
+    ensure!(
+        used.len() == references.len(),
+        "Spatial pack cache contains unreferenced blocks"
+    );
     manifest.insert("cells".to_owned(), Value::Object(cells));
     let payload = canonical_json(&Value::Object(manifest))?;
     ensure!(
@@ -717,9 +863,16 @@ pub(crate) fn write_manifest(
         "Manifest size accounting mismatch"
     );
     let digest = write_object(output, "manifests", &payload)?;
+    let pack_bytes: usize = references.values().map(|reference| reference.length).sum();
+    crate::progress::message(&format!(
+        "Packed {} logical blocks into {} objects ({pack_bytes} bytes)",
+        references.len(),
+        packs.len()
+    ));
     Ok(json!({"region": metadata["region"], "manifest": digest,
         "sourceTimestamp": metadata["sourceTimestamp"], "count": count,
-        "excludedIncompleteRelationCount": excluded}))
+        "excludedIncompleteRelationCount": excluded,
+        "blockCount": references.len(), "packCount": packs.len(), "packBytes": pack_bytes}))
 }
 
 pub(crate) fn compile_database(

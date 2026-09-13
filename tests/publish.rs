@@ -3,7 +3,7 @@ use aura_osm::dispatch::Lease;
 use aura_osm::format::{MAX_BLOCK, MAX_CURRENT, hash_bytes};
 use aura_osm::publish::{Progress, PublishConfig, Publisher};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -118,6 +118,50 @@ struct Build {
 }
 
 impl Build {
+    fn packed(count: usize) -> Self {
+        let mut build = Self::new(count);
+        fs::create_dir(build.path().join("packs")).unwrap();
+        let mut packs = BTreeSet::new();
+        let mut pages = Vec::new();
+        for keys in build.keys.chunks(2) {
+            let mut bytes = Vec::new();
+            let mut slices = Vec::new();
+            for key in keys {
+                let block = fs::read(build.path().join(key)).unwrap();
+                slices.push((hash_bytes(&block), bytes.len(), block.len()));
+                bytes.extend_from_slice(&block);
+            }
+            let pack = hash_bytes(&bytes);
+            fs::write(build.path().join(format!("packs/{pack}.bin")), bytes).unwrap();
+            packs.insert(pack.clone());
+            pages.extend(
+                slices
+                    .into_iter()
+                    .map(|(hash, offset, length)| (hash, pack.clone(), offset, length)),
+            );
+        }
+        let packs: Vec<_> = packs.into_iter().collect();
+        let pages: Vec<_> = pages
+            .into_iter()
+            .map(|(hash, pack, offset, length)| {
+                json!([hash, packs.binary_search(&pack).unwrap(), offset, length])
+            })
+            .collect();
+        build.keys = packs
+            .iter()
+            .map(|pack| format!("packs/{pack}.bin"))
+            .collect();
+        build.manifest["schema"] = json!(2);
+        build.manifest["packs"] = json!(packs);
+        build.manifest["cells"] = if count == 0 {
+            json!({})
+        } else {
+            json!({"9000_18000":pages})
+        };
+        build.save_manifest();
+        build
+    }
+
     fn new(count: usize) -> Self {
         let directory = temporary();
         fs::create_dir(directory.path().join("blocks")).unwrap();
@@ -504,7 +548,11 @@ impl Remote {
         );
         assert_eq!(
             request.headers.get("content-type").unwrap(),
-            "application/json"
+            if key.starts_with("packs/") {
+                "application/octet-stream"
+            } else {
+                "application/json"
+            }
         );
         assert_eq!(
             request.headers.get("cache-control").unwrap(),
@@ -585,6 +633,140 @@ fn validates_uploads_blocks_then_manifest_publishes_and_resumes() {
     assert_eq!(second["uploaded"], 0);
     assert_eq!(second["reused"], 2);
     assert_eq!(second["bytes"], 0);
+}
+
+#[test]
+fn packed_publication_uploads_physical_objects_once_and_preserves_logical_bytes() {
+    let build = Build::packed(5);
+    assert_eq!(build.keys.len(), 3);
+    let remote = Remote::new(&build);
+    let server = Remote::server(&remote);
+    let publisher = publisher(&server, &[]);
+    let mut progress = Vec::new();
+    let receipt = publisher
+        .publish(build.path(), &lease(), |event| progress.push(event))
+        .unwrap();
+    assert_eq!(receipt["uploaded"], 4);
+    assert_eq!(receipt["reused"], 0);
+    assert!(
+        progress
+            .iter()
+            .filter(|event| event.stage == "upload")
+            .all(|event| event.total == Some(4))
+    );
+    let requests = server.requests.lock().unwrap().clone();
+    let puts: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "PUT")
+        .collect();
+    assert_eq!(puts.len(), 4);
+    assert_eq!(
+        puts.last().unwrap().path,
+        format!("/osm-test/{}", build.manifest_key)
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.path.contains("/blocks/"))
+    );
+    for key in &build.keys {
+        let uploaded: Vec<_> = puts
+            .iter()
+            .filter(|request| request.path == format!("/osm-test/{key}"))
+            .collect();
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(uploaded[0].body, fs::read(build.path().join(key)).unwrap());
+        assert_eq!(
+            uploaded[0].headers["content-type"],
+            "application/octet-stream"
+        );
+    }
+    for page in build.manifest["cells"]["9000_18000"].as_array().unwrap() {
+        let hash = page[0].as_str().unwrap();
+        let pack = build.manifest["packs"][page[1].as_u64().unwrap() as usize]
+            .as_str()
+            .unwrap();
+        let uploaded = puts
+            .iter()
+            .find(|request| request.path == format!("/osm-test/packs/{pack}.bin"))
+            .unwrap();
+        let offset = page[2].as_u64().unwrap() as usize;
+        let length = page[3].as_u64().unwrap() as usize;
+        let original = fs::read(build.path().join(format!("blocks/{hash}.json"))).unwrap();
+        assert_eq!(&uploaded.body[offset..offset + length], original);
+        assert_eq!(hash_bytes(&uploaded.body[offset..offset + length]), hash);
+    }
+    let second = publisher.publish(build.path(), &lease(), |_| {}).unwrap();
+    assert_eq!(second["uploaded"], 0);
+    assert_eq!(second["reused"], 4);
+    assert_eq!(
+        server
+            .events()
+            .iter()
+            .filter(|(method, _)| method == "PUT")
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn packed_local_corruption_and_invalid_slices_fail_before_network() {
+    for case in 0..5 {
+        let mut build = Build::packed(4);
+        match case {
+            0 => fs::write(build.path().join(&build.keys[0]), b"corrupt pack").unwrap(),
+            1 => {
+                let pages = build.manifest["cells"]["9000_18000"]
+                    .as_array_mut()
+                    .unwrap();
+                let offset = pages[0][2].clone();
+                pages[0][2] = pages[1][2].clone();
+                pages[1][2] = offset;
+            }
+            2 => build.manifest["cells"]["9000_18000"][0][0] = json!("f".repeat(64)),
+            3 => build.manifest["cells"]["9000_18000"][0][1] = json!(2),
+            4 => {
+                let old = build.manifest["packs"][0].as_str().unwrap().to_owned();
+                let mut bytes = fs::read(build.path().join(format!("packs/{old}.bin"))).unwrap();
+                bytes.push(b' ');
+                let new = hash_bytes(&bytes);
+                fs::write(build.path().join(format!("packs/{new}.bin")), bytes).unwrap();
+                let previous: Vec<_> = build.manifest["packs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap().to_owned())
+                    .collect();
+                let mut packs = previous.clone();
+                packs[0] = new.clone();
+                packs.sort();
+                for page in build.manifest["cells"]["9000_18000"]
+                    .as_array_mut()
+                    .unwrap()
+                {
+                    let index = page[1].as_u64().unwrap() as usize;
+                    let hash = if index == 0 { &new } else { &previous[index] };
+                    page[1] = json!(packs.binary_search(hash).unwrap());
+                }
+                build.manifest["packs"] = json!(packs);
+            }
+            _ => unreachable!(),
+        }
+        if case != 3 {
+            aura_osm::format::validate_manifest(&build.manifest).unwrap();
+        }
+        build.save_manifest();
+        let remote = Remote::new(&build);
+        let server = Remote::server(&remote);
+        assert!(
+            publisher(&server, &[])
+                .publish(build.path(), &lease(), |_| {})
+                .is_err(),
+            "case {case}"
+        );
+        assert!(server.events().is_empty(), "case {case}");
+        assert!(!build.path().join("publish-receipt.json").exists());
+    }
 }
 
 #[test]
@@ -1395,7 +1577,7 @@ fn cancellation_during_head_does_not_start_put_or_change_local_artifacts() {
 fn failed_object_stops_dispatch_and_drains_inflight_objects() {
     let build = Build::new(6);
     let remote = Remote::new(&build);
-    let failing = format!("/osm-test/{}", build.keys[0]);
+    let failure_sent = AtomicBool::new(false);
     let started = Arc::new(Mutex::new(HashSet::new()));
     let started_handler = started.clone();
     let first_wave = Arc::new(Wave::new(3));
@@ -1409,7 +1591,7 @@ fn failed_object_stops_dispatch_and_drains_inflight_objects() {
                 first_wave.wait();
             }
             if request.method == "PUT" {
-                if request.path == failing {
+                if !failure_sent.swap(true, Ordering::SeqCst) {
                     failed.send(()).unwrap();
                     return Reply::status(403);
                 }

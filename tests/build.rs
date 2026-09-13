@@ -56,15 +56,28 @@ fn read_output(output: &Path, receipt: &Value) -> (Value, Vec<Value>) {
     let manifest: Value = serde_json::from_slice(&bytes).unwrap();
     let mut records = Vec::new();
     for hashes in manifest["cells"].as_object().unwrap().values() {
-        for hash in hashes.as_array().unwrap() {
-            let digest = hash.as_str().unwrap();
-            let bytes = fs::read(output.join(format!("blocks/{digest}.json"))).unwrap();
-            assert_eq!(hash_bytes(&bytes), digest);
+        for page in hashes.as_array().unwrap() {
+            let digest = page[0].as_str().unwrap();
+            let pack = manifest["packs"][page[1].as_u64().unwrap() as usize]
+                .as_str()
+                .unwrap();
+            let packed = fs::read(output.join(format!("packs/{pack}.bin"))).unwrap();
+            assert_eq!(hash_bytes(&packed), pack);
+            assert!(packed.len() <= aura_osm::format::MAX_PACK);
+            let offset = page[2].as_u64().unwrap() as usize;
+            let length = page[3].as_u64().unwrap() as usize;
+            let bytes = &packed[offset..offset + length];
+            assert_eq!(
+                bytes,
+                fs::read(output.join(format!("blocks/{digest}.json"))).unwrap()
+            );
+            assert_eq!(hash_bytes(bytes), digest);
             assert!(bytes.len() <= 262144);
-            records.extend(serde_json::from_slice::<Vec<Value>>(&bytes).unwrap());
+            records.extend(serde_json::from_slice::<Vec<Value>>(bytes).unwrap());
         }
     }
     assert_eq!(records.len() as u64, receipt["count"].as_u64().unwrap());
+    aura_osm::format::validate_manifest(&manifest).unwrap();
     (manifest, records)
 }
 
@@ -183,7 +196,7 @@ fn broken_way_cycle_or_empty_geometry_cannot_publish_or_hide_in_partial_relation
 fn page_boundaries_hashes_and_worker_counts_are_deterministic() {
     let work = common::work("build-pages-");
     let mut xml = String::from("<osm version=\"0.6\">");
-    for index in 1..601 {
+    for index in 1..1601 {
         xml.push_str(&format!(r#"<node id="{index}" lat="-33" lon="151"><tag k="name" v="{index} {}"/><tag k="shop" v="books"/></node>"#, "x".repeat(900)));
     }
     xml.push_str("</osm>");
@@ -191,7 +204,9 @@ fn page_boundaries_hashes_and_worker_counts_are_deterministic() {
     let (_, second, second_records) = compile(work.path(), "parallel", &xml, 4).unwrap();
     assert_eq!(first["cells"], second["cells"]);
     assert_eq!(records, second_records);
-    assert_eq!(records.len(), 600);
+    assert_eq!(records.len(), 1600);
+    assert!(first["packs"].as_array().unwrap().len() > 1);
+    assert_eq!(first["packs"], second["packs"]);
     let ids: Vec<_> = records
         .iter()
         .map(|row| row["id"].as_str().unwrap())
@@ -208,6 +223,35 @@ fn page_boundaries_hashes_and_worker_counts_are_deterministic() {
             .unwrap()
             .len()
             > 1
+    );
+}
+
+#[test]
+fn sparse_cells_pack_into_one_object_without_changing_any_logical_block_bytes() {
+    let work = common::work("build-sparse-packs-");
+    let mut xml = String::from("<osm version=\"0.6\">");
+    for y in 0..16 {
+        for x in 0..16 {
+            let id = y * 16 + x + 1;
+            let lat = -33.995 + f64::from(y) * 0.01;
+            let lon = 150.885 + f64::from(x) * 0.01;
+            xml.push_str(&format!(r#"<node id="{id}" lat="{lat:.3}" lon="{lon:.3}"><tag k="name" v="Cafe {id}"/><tag k="amenity" v="cafe"/></node>"#));
+        }
+    }
+    xml.push_str("</osm>");
+    let (receipt, manifest, records) = compile(work.path(), "sparse", &xml, 2).unwrap();
+    assert_eq!(records.len(), 256);
+    assert_eq!(manifest["schema"], 2);
+    assert_eq!(manifest["cells"].as_object().unwrap().len(), 256);
+    assert_eq!(receipt["blockCount"], 256);
+    assert_eq!(receipt["packCount"], 1);
+    let pack = manifest["packs"][0].as_str().unwrap();
+    let bytes = fs::read(work.path().join(format!("sparse/packs/{pack}.bin"))).unwrap();
+    assert_eq!(receipt["packBytes"], bytes.len());
+    println!(
+        "Sparse fixture: 256 logical blocks -> 1 physical pack; {} POIs, {} bytes; 257 -> 2 immutable-object PUTs including manifest",
+        records.len(),
+        bytes.len()
     );
 }
 

@@ -73,3 +73,15 @@ Worker 在同一个 Durable Object 事务中校验租约、合并发布清单并
 保留数据目录以支持后续更新。`--cleanup` 会在发布确认后删除本机地区索引和对应下载，仅用于不需要保留索引的批量处理。`schedule` 只在一台 Mac 安装，用于每月提交更新批次；其他设备运行 `work`。Linux 可用系统服务托管 `work`，由一台设备的定时任务提交 `update all`。
 
 从单任务版本升级时，停止各设备的旧 Builder，部署配套 Worker，再更新并启动 Builder。云端已有发布数据、批次和租约保留；旧租约归入任务位置 0。旧版领取和释放请求不符合新协议，不能与新版混跑。
+
+## R2 打包存储
+
+Builder 保留 0.01° 查询网格和每个 POI 的原始数据，将同一 16 × 16 网格组内的小块拼成最大 1 MiB 的不可变包，上传 `packs/<SHA256>.bin` 和地区 manifest。清单记录包目录以及各小块的哈希、包编号、偏移和长度；Worker 按范围读取所需小块。本地 `blocks/` 供增量构建使用，不再逐块上传。
+
+更新只重打包发生变化的网格组；内容未变的包复用原哈希。发布结果的 `uploaded`、`reused` 统计物理对象数，包含 manifest。`--cleanup` 仍在发布确认后删除本地区本地数据，包括小块和包。
+
+构建日志输出逻辑小块数、物理包数和字节数，`release.json` 保存 `blockCount`、`packCount`、`packBytes`。比较账单时使用相同地区和更新频率；初次迁移需要上传新包，后续更新复用未变的包。打包减少对象写入次数，不改变 POI 数据量。
+
+升级时先部署支持 schema 1 和 2 的 Worker，再更新各设备的 Builder。已发布的旧地区继续可查；`bootstrap all` 会跳过它们，用 `update all --submit-only` 逐地区切换到打包格式。有本地索引时，旧产物转换不需要重新解析 PBF；没有本地索引时仍需下载完整源重建。云端旧对象保留，此次升级不执行 R2 列举或删除。
+
+本地验证使用 `cargo test`。跨仓库联调：在 Worker 目录运行 `npm run test:serve`，将输出的两个回环地址设为 `OSM_TEST_WORKER_URL`、`OSM_TEST_R2_ENDPOINT`，再运行 `cargo test --test worker_integration -- --ignored`；完成后按 Enter 停止服务。此联调使用隔离存储，不产生 Cloudflare 用量。

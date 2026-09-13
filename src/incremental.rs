@@ -65,7 +65,7 @@ fn state_path(path: &Path, create: bool) -> Result<PathBuf> {
 fn load_control(connection: &Connection) -> Result<(Value, String, Value)> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     ensure!(
-        version == 1,
+        matches!(version, 1 | 2),
         "State initialization is incomplete or its format is unsupported"
     );
     let record: Option<(String, String, String)> = connection
@@ -102,6 +102,49 @@ fn export_committed(connection: &Connection, state: &Path) -> Result<Value> {
     );
     result.insert("output".to_owned(), json!(output));
     Ok(Value::Object(result))
+}
+
+fn upgrade_packing(connection: &Connection, state: &Path) -> Result<()> {
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 2 {
+        return Ok(());
+    }
+    let (metadata, _, previous) = load_control(connection)?;
+    let region = metadata["region"]
+        .as_str()
+        .filter(|region| crate::format::is_region(region))
+        .context("Invalid stored region")?;
+    let marker = state
+        .parent()
+        .context("State has no parent directory")?
+        .join(format!(".cleanup-{region}.json"));
+    match fs::symlink_metadata(&marker) {
+        Ok(_) => {
+            bail!("Regional cleanup is pending; resume work --cleanup before upgrading the index")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("Cannot inspect regional cleanup record"),
+    }
+    build::create_pack_index(connection)?;
+    let output = state.join("output");
+    build::write_packs(connection, &output, false)?;
+    let receipt = build::write_manifest(
+        connection,
+        &output,
+        &metadata,
+        previous["count"]
+            .as_u64()
+            .context("Invalid stored POI count")?,
+        previous["excludedIncompleteRelationCount"]
+            .as_u64()
+            .unwrap_or(0),
+    )?;
+    connection.execute(
+        "UPDATE control SET receipt=? WHERE id=1",
+        [String::from_utf8(canonical_json(&receipt)?)?],
+    )?;
+    connection.pragma_update(None, "user_version", 2)?;
+    Ok(())
 }
 
 pub fn initialize(options: &InitOptions, compute: &ComputeOptions) -> Result<Value> {
@@ -145,7 +188,7 @@ pub fn initialize(options: &InitOptions, compute: &ComputeOptions) -> Result<Val
             String::from_utf8(canonical_json(&receipt)?)?,
         ],
     )?;
-    transaction.pragma_update(None, "user_version", 1)?;
+    transaction.pragma_update(None, "user_version", 2)?;
     transaction.commit()?;
     export_committed(&connection, &state)
 }
@@ -355,6 +398,7 @@ pub fn apply_diff(options: &ApplyOptions, compute: &ComputeOptions) -> Result<Va
     load_control(&connection)?;
     let digest = stage_changes(&mut connection, &options.input, compute)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    upgrade_packing(&transaction, &state)?;
     let (mut metadata, _, prior) = load_control(&transaction)?;
     let expected = metadata["sourceSequence"]
         .as_u64()
@@ -410,8 +454,11 @@ pub fn status(state: &Path, options: &ComputeOptions) -> Result<Value> {
     let state = state_path(state, false)?;
     let mut connection = build::open_database(&state.join("state.sqlite"), false, options)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let result = export_committed(&transaction, &state)?;
+    upgrade_packing(&transaction, &state)?;
     transaction.commit()?;
+    let snapshot = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = export_committed(&snapshot, &state)?;
+    snapshot.commit()?;
     Ok(result)
 }
 
