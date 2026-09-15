@@ -1,6 +1,7 @@
 use aura_osm::config::{Environment, Runtime};
 use aura_osm::dispatch::Lease;
 use aura_osm::format::{MAX_BLOCK, MAX_CURRENT, hash_bytes};
+use aura_osm::network;
 use aura_osm::publish::{Progress, PublishConfig, Publisher};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -1002,11 +1003,10 @@ fn failed_upload_or_verification_blocks_manifest_and_completion() {
         }
         let server = Remote::server(&remote);
         let mut progress = Vec::new();
-        assert!(
-            publisher(&server, &[])
-                .publish(build.path(), &lease(), |event| progress.push(event))
-                .is_err()
-        );
+        let error = publisher(&server, &[])
+            .publish(build.path(), &lease(), |event| progress.push(event))
+            .unwrap_err();
+        assert_eq!(network::retryable(&error), !verify);
         assert!(
             !server
                 .events()
@@ -1030,6 +1030,36 @@ fn failed_upload_or_verification_blocks_manifest_and_completion() {
             );
         }
     }
+}
+
+#[test]
+fn concurrent_upload_rejection_is_not_hidden_by_network_failure() {
+    let build = Build::new(2);
+    let network_path = format!("/osm-test/{}", build.keys[0]);
+    let uploads = std::sync::Barrier::new(2);
+    let server = Server::new(move |request| {
+        if request.method == "HEAD" {
+            return Reply::status(404);
+        }
+        assert_eq!(request.method, "PUT");
+        uploads.wait();
+        if request.path == network_path {
+            Reply::status(503)
+        } else {
+            Reply {
+                delay: Duration::from_millis(30),
+                ..Reply::status(403)
+            }
+        }
+    });
+    let error = publisher(
+        &server,
+        &[("OSM_HTTP_ATTEMPTS", "1"), ("OSM_UPLOAD_CONCURRENCY", "2")],
+    )
+    .publish(build.path(), &lease(), |_| {})
+    .unwrap_err();
+    assert!(!network::retryable(&error), "{error:#}");
+    assert!(!build.path().join("publish-receipt.json").exists());
 }
 
 fn region_release(region: &str, manifest: &str) -> Value {
@@ -1181,6 +1211,7 @@ fn publication_uncertain_responses_stop_at_the_configured_attempt_limit() {
         .publish(build.path(), &lease(), |_| {})
         .unwrap_err();
     assert!(error.to_string().contains("after 2 attempts"), "{error}");
+    assert!(network::retryable(&error));
     assert_eq!(remote.lock().unwrap().publish_leases.len(), 2);
     assert!(!build.path().join("publish-receipt.json").exists());
 }
@@ -1195,6 +1226,7 @@ fn publication_existing_manifest_requires_a_completion_acknowledgement() {
             ..Reply::status(200)
         },
     ] {
+        let transient = reply.status == 503;
         let build = Build::new(0);
         let remote = Remote::new(&build);
         {
@@ -1209,10 +1241,13 @@ fn publication_existing_manifest_requires_a_completion_acknowledgement() {
             .publish(build.path(), &lease(), |event| progress.push(event))
             .unwrap_err();
         let message = format!("{error:#}");
+        assert_eq!(network::retryable(&error), transient);
         assert!(!message.contains(TOKEN) && !message.contains(SECRET));
         let remote = remote.lock().unwrap();
-        assert_eq!(remote.publish_leases.len(), 2);
-        assert_eq!(remote.publish_leases[0], remote.publish_leases[1]);
+        assert_eq!(remote.publish_leases.len(), if transient { 2 } else { 1 });
+        if transient {
+            assert_eq!(remote.publish_leases[0], remote.publish_leases[1]);
+        }
         assert!(
             !server
                 .events()
@@ -1325,10 +1360,9 @@ fn state_errors_are_bounded_sanitized_and_redirects_never_followed() {
             body: format!("{TOKEN} {SECRET}").into_bytes(),
             ..Reply::status(status)
         });
-        let error = publisher(&server, &[])
-            .read_state()
-            .unwrap_err()
-            .to_string();
+        let error = publisher(&server, &[]).read_state().unwrap_err();
+        assert_eq!(network::retryable(&error), status == 503);
+        let error = error.to_string();
         assert!(error.contains(message));
         assert!(!error.contains(TOKEN) && !error.contains(SECRET));
         assert_eq!(server.events().len(), attempts);
@@ -1354,7 +1388,9 @@ fn state_errors_are_bounded_sanitized_and_redirects_never_followed() {
             body: body.clone(),
             ..Reply::status(200)
         });
-        let error = format!("{:#}", publisher(&server, &[]).read_state().unwrap_err());
+        let error = publisher(&server, &[]).read_state().unwrap_err();
+        assert!(!network::retryable(&error));
+        let error = format!("{error:#}");
         assert!(error.contains(message), "{error}");
         assert!(!error.contains(TOKEN) && !error.contains(SECRET));
         assert_eq!(server.events().len(), 1);
@@ -1390,6 +1426,42 @@ fn state_body_truncation_and_timeout_retry_but_invalid_schema_does_not() {
     );
     assert_eq!(server.events().len(), 2);
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn exhausted_state_and_publish_transport_errors_remain_retryable() {
+    for reply in [
+        Reply {
+            disconnect: true,
+            ..Reply::status(200)
+        },
+        Reply {
+            headers: vec![("Content-Length".into(), "40".into())],
+            body: b"nu".to_vec(),
+            ..Reply::status(200)
+        },
+    ] {
+        let state_reply = reply.clone();
+        let server = Server::new(move |_| state_reply.clone());
+        let error = publisher(&server, &[("OSM_HTTP_ATTEMPTS", "2")])
+            .read_state()
+            .unwrap_err();
+        assert!(network::retryable(&error), "{error:#}");
+        assert_eq!(server.events().len(), 2);
+
+        let build = Build::new(0);
+        let remote = Remote::new(&build);
+        remote.lock().unwrap().publish_replies = VecDeque::from([reply.clone(), reply]);
+        let server = Remote::server(&remote);
+        let error = publisher(&server, &[("OSM_HTTP_ATTEMPTS", "2")])
+            .publish(build.path(), &lease(), |_| {})
+            .unwrap_err();
+        assert!(network::retryable(&error), "{error:#}");
+        let remote = remote.lock().unwrap();
+        assert_eq!(remote.publish_leases.len(), 2);
+        assert_eq!(remote.publish_leases[0], remote.publish_leases[1]);
+        assert!(!build.path().join("publish-receipt.json").exists());
+    }
 }
 
 #[test]

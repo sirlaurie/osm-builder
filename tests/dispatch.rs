@@ -1,4 +1,5 @@
 use aura_osm::dispatch::{Client, Guard, Lease, ReleaseOutcome, device_id};
+use aura_osm::network;
 use aura_osm::source::Region;
 use chrono::{SecondsFormat, Utc};
 use reqwest::header::HeaderValue;
@@ -440,4 +441,58 @@ fn guard_rejects_lost_lease_and_drop_wakes_a_pending_renewal() {
     drop(guard);
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn transport_and_service_outages_are_retryable_but_rejections_are_not() {
+    for (status, disconnect, retryable) in [
+        (200, true, true),
+        (429, false, true),
+        (503, false, true),
+        (401, false, false),
+        (409, false, false),
+        (200, false, false),
+    ] {
+        let server = Server::new(move |_, _| Reply {
+            status,
+            body: b"invalid JSON".to_vec(),
+            disconnect,
+        });
+        let error = server.client(2).jobs().unwrap_err();
+        assert_eq!(network::retryable(&error), retryable, "{error:#}");
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            if retryable { 2 } else { 1 }
+        );
+        assert!(!format!("{error:#}").contains(AUTHORIZATION));
+    }
+}
+
+#[test]
+fn renewal_recovers_from_network_outage_without_losing_a_valid_lease() {
+    let calls = Mutex::new(0);
+    let server = Server::new(move |path, value| {
+        assert_eq!(path, "/admin/jobs/renew");
+        let mut count = calls.lock().unwrap();
+        *count += 1;
+        if *count == 1 {
+            Reply {
+                status: 503,
+                ..Reply::json(Value::Null)
+            }
+        } else {
+            let mut lease = value["lease"].clone();
+            lease["renewAfterSeconds"] = json!(60);
+            Reply::json(lease)
+        }
+    });
+    let mut offered = lease();
+    offered.renew_after_seconds = 1;
+    let guard = Guard::start(server.client(1), offered).unwrap();
+    let until = Instant::now() + Duration::from_secs(4);
+    while guard.lease().unwrap().renew_after_seconds != 60 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(guard.lease().unwrap().renew_after_seconds, 60);
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
 }

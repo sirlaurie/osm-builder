@@ -7,7 +7,7 @@ use std::{
         Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    thread::JoinHandle,
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
@@ -169,6 +169,13 @@ impl Downloader {
     }
 
     fn check_cancelled(&self) -> Result<()> {
+        if let Some((flow, _)) = self
+            .control
+            .as_ref()
+            .and_then(|control| control.pipeline.as_ref())
+        {
+            flow.check()?;
+        }
         ensure!(
             self.control
                 .as_ref()
@@ -188,7 +195,10 @@ impl Downloader {
         if let Some(control) = &self.control {
             tokio::select! {
                 biased;
-                _ = control.cancelled() => bail!("Prefetch cancelled"),
+                _ = control.cancelled() => {
+                    self.check_cancelled()?;
+                    bail!("Prefetch cancelled")
+                },
                 result = future => Ok(result),
             }
         } else {
@@ -265,8 +275,11 @@ impl Downloader {
                 deadline,
                 self.client.get(url).send(),
             ))
-            .await???
-            .error_for_status()?;
+            .await?
+            .map_err(|_| crate::network::Transient("Download request timed out".into()))?
+            .map_err(crate::network::request)?
+            .error_for_status()
+            .map_err(crate::network::request)?;
         if let (Some(length), Some(limit)) = (response.content_length(), limit) {
             ensure!(length <= limit, "Download exceeds limit: {url}");
         }
@@ -285,7 +298,9 @@ impl Downloader {
         loop {
             let Some(buffer) = self
                 .interruptible(tokio::time::timeout_at(deadline, response.chunk()))
-                .await???
+                .await?
+                .map_err(|_| crate::network::Transient("Download response timed out".into()))?
+                .map_err(crate::network::request)?
             else {
                 break;
             };
@@ -464,8 +479,10 @@ impl Prefetch {
                     && let Some((flow, _)) = &thread_control.pipeline
                 {
                     thread_control.failed.store(true, Ordering::Release);
-                    *flow.failure.lock().expect("pipeline failure lock") =
-                        Some(format!("Region {} prefetch failed: {error:#}", entry.id));
+                    flow.record_failure(crate::network::summary(
+                        error,
+                        format!("Region {} prefetch failed: {error:#}", entry.id),
+                    ));
                     flow.stop();
                 }
                 result
@@ -1045,7 +1062,7 @@ struct PipelineFlow {
     upload: Mutex<()>,
     download: Mutex<()>,
     controls: Mutex<Vec<Weak<DownloadControl>>>,
-    failure: Mutex<Option<String>>,
+    failure: Mutex<Option<anyhow::Error>>,
     cleanup: bool,
 }
 
@@ -1069,6 +1086,11 @@ impl PipelineFlow {
     }
 
     fn check(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire)
+            && let Some(error) = self.failure.lock().expect("pipeline failure lock").as_ref()
+        {
+            return Err(crate::network::summary(error, format!("{error:#}")));
+        }
         ensure!(
             !self.cancelled.load(Ordering::Acquire),
             "Pipeline stopped after a regional failure"
@@ -1097,6 +1119,15 @@ impl PipelineFlow {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         self.compute_changed.notify_all();
+    }
+
+    fn record_failure(&self, error: anyhow::Error) {
+        let mut failure = self.failure.lock().expect("pipeline failure lock");
+        if failure.as_ref().is_none_or(|previous| {
+            crate::network::retryable(previous) && !crate::network::retryable(&error)
+        }) {
+            *failure = Some(error);
+        }
     }
 
     fn phase(&self, slot: usize, phase: WorkPhase) {
@@ -1230,6 +1261,7 @@ fn execute_work(operations: &impl WorkOperations, once: bool, cleanup: bool) -> 
                                 (claim, ticket)
                             },
                             Err(error) => {
+                                flow.record_failure(crate::network::summary(&error, format!("{error:#}")));
                                 flow.stop();
                                 return Err(error);
                             }
@@ -1287,11 +1319,15 @@ fn execute_work(operations: &impl WorkOperations, once: bool, cleanup: bool) -> 
                         Ok(())
                     })();
                     if let Err(error) = result {
-                        let outcome = if flow.cancelled.load(Ordering::Acquire) && !operations.failed(&task) {
+                        let sibling_cancelled = flow.cancelled.load(Ordering::Acquire) && !operations.failed(&task);
+                        let outcome = if crate::network::retryable(&error) || sibling_cancelled {
                             dispatch::ReleaseOutcome::Retry
                         } else {
                             dispatch::ReleaseOutcome::Failed
                         };
+                        if !sibling_cancelled {
+                            flow.record_failure(crate::network::summary(&error, format!("Region {region} failed: {error:#}")));
+                        }
                         flow.stop();
                         if let Err(release_error) = operations.release(&mut task, outcome) {
                             progress::message(&format!("Could not release task: {release_error:#}"));
@@ -1308,17 +1344,38 @@ fn execute_work(operations: &impl WorkOperations, once: bool, cleanup: bool) -> 
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => errors.push(format!("{error:#}")),
                 Err(_) => {
+                    flow.record_failure(anyhow::anyhow!("Regional worker panicked"));
                     flow.stop();
                     errors.push("Regional worker panicked".into());
                 }
             }
         }
         if let Some(failure) = flow.failure.lock().expect("pipeline failure lock").take() {
-            errors.insert(0, failure);
+            return Err(failure);
         }
         ensure!(errors.is_empty(), "{}", errors.join("; "));
         Ok(())
     })
+}
+
+fn wait_for_work(
+    operations: &impl WorkOperations,
+    once: bool,
+    cleanup: bool,
+    retry_delay: Duration,
+) -> Result<()> {
+    loop {
+        match execute_work(operations, once, cleanup) {
+            Err(error) if crate::network::retryable(&error) => {
+                progress::message(&format!(
+                    "Network unavailable: {error:#}; retrying work in {}s",
+                    retry_delay.as_secs()
+                ));
+                thread::sleep(retry_delay);
+            }
+            result => return result,
+        }
+    }
 }
 
 struct ClaimedRegion {
@@ -1548,7 +1605,7 @@ pub fn work(
     let scratch = root.join(".build/tools/tmp");
     fs::create_dir_all(&scratch)?;
     println!("Device {device}: waiting for regional tasks");
-    execute_work(
+    wait_for_work(
         &CloudWork {
             runtime,
             environment,
@@ -1560,6 +1617,7 @@ pub fn work(
         },
         once,
         cleanup,
+        Duration::from_secs(60),
     )
 }
 
@@ -1975,6 +2033,124 @@ mod tests {
         assert!(position("prepare:c") < position("computed:b"));
     }
 
+    struct RecoveringWork {
+        stage: &'static str,
+        fatal: bool,
+        failures: AtomicUsize,
+        occupied: AtomicBool,
+        acknowledged: AtomicBool,
+        cleaned: AtomicUsize,
+        releases: Mutex<Vec<&'static str>>,
+    }
+
+    impl RecoveringWork {
+        fn fail_once(&self, stage: &str) -> Result<()> {
+            if self.stage == stage && self.failures.fetch_add(1, Ordering::SeqCst) == 0 {
+                if self.fatal {
+                    bail!("Invalid response");
+                }
+                return Err(crate::network::Transient("TLS connection timeout".into()).into());
+            }
+            Ok(())
+        }
+    }
+
+    impl WorkOperations for RecoveringWork {
+        type Task = ();
+        type Output = ();
+
+        fn claim(&self, _: u8) -> Result<WorkClaim<()>> {
+            self.fail_once("claim")?;
+            if self.acknowledged.load(Ordering::SeqCst)
+                || self.occupied.swap(true, Ordering::SeqCst)
+            {
+                return Ok(WorkClaim::Idle {
+                    done: self.acknowledged.load(Ordering::SeqCst),
+                    failed: 0,
+                    retry: Duration::from_millis(1),
+                });
+            }
+            Ok(WorkClaim::Task(()))
+        }
+
+        fn region<'a>(&self, _: &'a ()) -> &'a str {
+            "test"
+        }
+        fn prepare(&self, _: &mut (), _: &Arc<PipelineFlow>, _: usize) -> Result<()> {
+            self.fail_once("prepare")
+        }
+        fn ready(&self, _: &()) -> Result<()> {
+            Ok(())
+        }
+        fn compute(&self, _: &mut (), flow: &Arc<PipelineFlow>, _: usize) -> Result<()> {
+            if self.stage == "prefetch" && self.failures.fetch_add(1, Ordering::SeqCst) == 0 {
+                flow.record_failure(
+                    crate::network::Transient("Prefetch connection timeout".into()).into(),
+                );
+                flow.stop();
+                return flow.check();
+            }
+            self.fail_once("compute")
+        }
+        fn publish(&self, _: &(), _: &(), _: &AtomicBool) -> Result<()> {
+            self.fail_once("publish")?;
+            self.acknowledged.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn cleanup(&self, _: &(), _: &()) -> Result<()> {
+            assert!(self.acknowledged.load(Ordering::SeqCst));
+            self.cleaned.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn release(&self, _: &mut (), outcome: dispatch::ReleaseOutcome) -> Result<()> {
+            assert!(!self.acknowledged.load(Ordering::SeqCst));
+            assert_eq!(self.cleaned.load(Ordering::SeqCst), 0);
+            self.releases.lock().unwrap().push(match outcome {
+                dispatch::ReleaseOutcome::Retry => "retry",
+                dispatch::ReleaseOutcome::Failed => "failed",
+            });
+            self.occupied.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn work_recovers_network_failures_without_cleanup_or_failed_tasks_and_rejects_fatal_errors() {
+        for stage in ["claim", "prepare", "compute", "prefetch", "publish"] {
+            for fatal in [false, true] {
+                if fatal && stage == "prefetch" {
+                    continue;
+                }
+                let operations = RecoveringWork {
+                    stage,
+                    fatal,
+                    failures: AtomicUsize::new(0),
+                    occupied: AtomicBool::new(false),
+                    acknowledged: AtomicBool::new(false),
+                    cleaned: AtomicUsize::new(0),
+                    releases: Mutex::new(Vec::new()),
+                };
+                let result = wait_for_work(&operations, true, true, Duration::from_millis(1));
+                assert_eq!(result.is_err(), fatal, "{stage}");
+                assert_eq!(
+                    operations.cleaned.load(Ordering::SeqCst),
+                    usize::from(!fatal)
+                );
+                let releases = operations.releases.lock().unwrap();
+                assert_eq!(
+                    *releases,
+                    if stage == "claim" {
+                        vec![]
+                    } else if fatal {
+                        vec!["failed"]
+                    } else {
+                        vec!["retry"]
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn distributed_pipeline_waits_for_confirmed_cleanup_before_computing_on_low_disk() {
         let operations = ScheduleOperations::new(ScheduleCase::LowDisk);
@@ -2121,6 +2297,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
+                .to_string()
                 .contains("france prefetch failed")
         );
     }

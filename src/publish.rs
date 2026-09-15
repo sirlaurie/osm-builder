@@ -3,9 +3,10 @@ use crate::dispatch::{self, Lease};
 use crate::format::{
     self, CellPage, Current, MAX_BLOCK, MAX_CURRENT, MAX_MANIFEST, MAX_PACK, Release,
 };
+use crate::network;
 use crate::progress::ProgressLine;
 use crate::storage::{atomic_write, read_bytes, read_local};
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningSettings,
@@ -417,7 +418,9 @@ impl Publisher {
                             };
                         }
                         Err(_) if attempt + 1 == self.attempts => {
-                            bail!("State response read failed")
+                            return Err(
+                                network::Transient("State response read failed".into()).into()
+                            );
                         }
                         Err(_) => {}
                     }
@@ -428,11 +431,17 @@ impl Publisher {
                         bail!("State request rejected: HTTP {status}");
                     }
                     if attempt + 1 == self.attempts {
-                        bail!("State request failed: HTTP {status}");
+                        return Err(network::Transient(format!(
+                            "State request failed: HTTP {status}"
+                        ))
+                        .into());
                     }
                 }
-                Err(_) if attempt + 1 == self.attempts => {
-                    bail!("State request failed after {} attempts", self.attempts)
+                Err(error) if attempt + 1 == self.attempts => {
+                    return Err(network::request(error).context(format!(
+                        "State request failed after {} attempts",
+                        self.attempts
+                    )));
                 }
                 Err(_) => {}
             }
@@ -523,13 +532,20 @@ impl Publisher {
             match request.send() {
                 Ok(response) => {
                     let status = response.status();
-                    if !(status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS)
-                        || attempt + 1 == self.attempts
-                    {
+                    if !(status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS) {
                         return Ok(response);
                     }
+                    if attempt + 1 == self.attempts {
+                        return Err(network::Transient(format!(
+                            "R2 request failed: HTTP {}",
+                            status.as_u16()
+                        ))
+                        .into());
+                    }
                 }
-                Err(_) if attempt + 1 == self.attempts => bail!("R2 request failed"),
+                Err(error) if attempt + 1 == self.attempts => {
+                    return Err(network::request(error).context("R2 request failed"));
+                }
                 Err(_) => {}
             }
             ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
@@ -541,7 +557,7 @@ impl Publisher {
     fn head(&self, object: &Object, cancelled: &AtomicBool) -> Result<bool> {
         let response = self
             .s3_request(Method::HEAD, object, None, cancelled)
-            .map_err(|_| anyhow!("R2 HEAD failed: {}", object.key))?;
+            .with_context(|| format!("R2 HEAD failed: {}", object.key))?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(false);
         }
@@ -575,7 +591,7 @@ impl Publisher {
         let (bytes, _) = read_bytes(root, &object.key, object.size, Some(&object.hash))?;
         let response = self
             .s3_request(Method::PUT, object, Some(&bytes), cancelled)
-            .map_err(|_| anyhow!("R2 upload failed: {}", object.key))?;
+            .with_context(|| format!("R2 upload failed: {}", object.key))?;
         if matches!(
             response.status(),
             StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED
@@ -679,12 +695,19 @@ impl Publisher {
                         record_upload(&mut stats, size, uploaded);
                         progress(stats.clone());
                     }
-                    Err(error) if failure.is_none() => failure = Some(error),
+                    Err(error)
+                        if failure.is_none()
+                            || (!cancelled.load(Ordering::Acquire)
+                                && failure.as_ref().is_some_and(network::retryable)
+                                && !network::retryable(&error)) =>
+                    {
+                        failure = Some(error);
+                    }
                     Err(_) => {}
                 }
             }
             for handle in handles {
-                if handle.join().is_err() && failure.is_none() {
+                if handle.join().is_err() {
                     failure = Some(anyhow!("Upload worker failed"));
                 }
             }
@@ -737,21 +760,41 @@ impl Publisher {
             }) {
                 bail!("Publish rejected: HTTP {}", status.as_u16());
             }
-            let acknowledged = response
-                .ok()
-                .filter(|response| response.status().is_success())
-                .and_then(|response| {
-                    let mut bytes = Vec::new();
-                    response.take(4097).read_to_end(&mut bytes).ok()?;
-                    (bytes.len() <= 4096).then_some(())?;
-                    let value: Value = serde_json::from_slice(&bytes).ok()?;
-                    (value["success"] == true
+            let acknowledged = (|| -> Result<()> {
+                let response = response.map_err(network::request)?;
+                let status = response.status();
+                if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+                    return Err(network::Transient(format!(
+                        "Publish request failed: HTTP {}",
+                        status.as_u16()
+                    ))
+                    .into());
+                }
+                let mut bytes = Vec::new();
+                response
+                    .take(4097)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| network::Transient("Publish response read failed".into()))?;
+                ensure!(bytes.len() <= 4096, "Publish response is too large");
+                let value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| anyhow!("Invalid publish response JSON"))?;
+                ensure!(
+                    value["success"] == true
                         && value["revision"].is_string()
-                        && value["unchanged"].is_boolean())
-                    .then_some(())
-                })
-                .is_some();
-            if acknowledged {
+                        && value["unchanged"].is_boolean(),
+                    "Invalid publish acknowledgement"
+                );
+                Ok(())
+            })();
+            if let Err(error) = acknowledged {
+                if !network::retryable(&error) || attempt + 1 == self.attempts {
+                    return Err(error.context(format!(
+                        "Publish outcome is unconfirmed after {} attempts",
+                        attempt + 1
+                    )));
+                }
+                self.backoff(attempt);
+            } else {
                 progress(Progress {
                     stage: "confirm",
                     ..event
@@ -768,12 +811,6 @@ impl Publisher {
                 published = state;
                 break;
             }
-            ensure!(
-                attempt + 1 < self.attempts,
-                "Publish outcome is unconfirmed after {} attempts; inspect osm jobs before retrying",
-                self.attempts
-            );
-            self.backoff(attempt);
         }
         let state = published.ok_or_else(|| anyhow!("Publish outcome is unconfirmed"))?;
         let mut receipt = serde_json::to_value(&build.release)?;

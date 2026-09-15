@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    format,
+    format, network,
     source::{Region, valid_extract},
     storage,
 };
@@ -146,6 +146,16 @@ impl Client {
     }
 
     fn request(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Value> {
+        self.request_until(method, path, body, None)
+    }
+
+    fn request_until(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        deadline: Option<Instant>,
+    ) -> Result<Value> {
         ensure!(
             (1..=10).contains(&self.attempts),
             "Invalid dispatch retry limit"
@@ -155,10 +165,11 @@ impl Client {
             .join(path)
             .map_err(|_| anyhow!("Invalid dispatch URL"))?;
         for attempt in 0..self.attempts {
+            let timeout = remaining(deadline)?.min(Duration::from_secs(30));
             let mut request = self
                 .http
                 .request(method.clone(), url.clone())
-                .timeout(Duration::from_secs(30))
+                .timeout(timeout)
                 .header("Authorization", self.authorization.clone());
             if let Some(body) = body {
                 request = request.json(body);
@@ -168,7 +179,11 @@ impl Client {
                     let status = response.status();
                     if status.as_u16() >= 500 || status.as_u16() == 429 {
                         if attempt + 1 == self.attempts {
-                            bail!("Dispatch request failed: HTTP {}", status.as_u16());
+                            return Err(network::Transient(format!(
+                                "Dispatch request failed: HTTP {}",
+                                status.as_u16()
+                            ))
+                            .into());
                         }
                     } else {
                         ensure!(
@@ -202,19 +217,35 @@ impl Client {
                                 }
                                 bail!("Dispatch request rejected: HTTP {}", status.as_u16());
                             }
-                            Err(_) if attempt + 1 == self.attempts => {
-                                bail!("Dispatch response read failed");
+                            Err(_) if !status.is_success() => {
+                                bail!("Dispatch request rejected: HTTP {}", status.as_u16());
+                            }
+                            Err(error) if attempt + 1 == self.attempts => {
+                                return Err(network::Transient(format!(
+                                    "Dispatch response read failed ({:?})",
+                                    error.kind()
+                                ))
+                                .into());
                             }
                             Err(_) => {}
                         }
                     }
                 }
-                Err(_) if attempt + 1 == self.attempts => {
-                    bail!("Dispatch request failed after {} attempts", self.attempts);
+                Err(error) => {
+                    let error = network::request(error);
+                    if !network::retryable(&error) || attempt + 1 == self.attempts {
+                        return Err(error.context(format!(
+                            "Dispatch request failed after {} attempts",
+                            attempt + 1
+                        )));
+                    }
                 }
-                Err(_) => {}
             }
-            thread::sleep(self.retry_delay.saturating_mul(1 << attempt));
+            thread::sleep(
+                self.retry_delay
+                    .saturating_mul(1 << attempt)
+                    .min(remaining(deadline)?),
+            );
         }
         bail!("Dispatch request has no attempts")
     }
@@ -294,11 +325,16 @@ impl Client {
     }
 
     pub fn renew(&self, lease: &Lease) -> Result<Lease> {
+        self.renew_until(lease, None)
+    }
+
+    fn renew_until(&self, lease: &Lease, deadline: Option<Instant>) -> Result<Lease> {
         lease.validate()?;
-        let value = self.request(
+        let value = self.request_until(
             Method::POST,
             "/admin/jobs/renew",
             Some(&json!({ "lease": lease })),
+            deadline,
         )?;
         let renewed: Lease = serde_json::from_value(value)
             .map_err(|_| anyhow!("Invalid dispatch renewal response"))?;
@@ -326,6 +362,19 @@ impl Client {
 
     pub fn jobs(&self) -> Result<Value> {
         self.request(Method::GET, "/admin/jobs", None)
+    }
+}
+
+fn remaining(deadline: Option<Instant>) -> Result<Duration> {
+    match deadline {
+        Some(deadline) => deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                network::Transient("Dispatch lease expired before renewal was confirmed".into())
+                    .into()
+            }),
+        None => Ok(Duration::MAX),
     }
 }
 
@@ -370,6 +419,7 @@ struct State {
     deadline: Instant,
     stopped: bool,
     failed: bool,
+    network_error: Option<network::Transient>,
 }
 
 pub struct Guard {
@@ -379,13 +429,18 @@ pub struct Guard {
 
 impl Guard {
     pub fn start(client: Client, lease: Lease) -> Result<Self> {
+        Self::start_with_ttl(client, lease, LEASE_TTL)
+    }
+
+    fn start_with_ttl(client: Client, lease: Lease, ttl: Duration) -> Result<Self> {
         lease.validate()?;
         let state = Arc::new((
             Mutex::new(State {
                 lease,
-                deadline: Instant::now() + LEASE_TTL,
+                deadline: Instant::now() + ttl,
                 stopped: false,
                 failed: false,
+                network_error: None,
             }),
             Condvar::new(),
         ));
@@ -395,7 +450,7 @@ impl Guard {
             .spawn(move || {
                 let (lock, wake) = &*shared;
                 loop {
-                    let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+                    let state = lock.lock().unwrap_or_else(|error| error.into_inner());
                     if state.stopped {
                         break;
                     }
@@ -404,31 +459,36 @@ impl Guard {
                             remaining.min(Duration::from_secs(state.lease.renew_after_seconds))
                         }
                         None => {
-                            state.failed = true;
                             break;
                         }
                     };
-                    let (mut state, _) = wake
+                    let (state, _) = wake
                         .wait_timeout_while(state, delay, |state| !state.stopped)
                         .unwrap_or_else(|error| error.into_inner());
                     if state.stopped {
                         break;
                     }
                     if Instant::now() >= state.deadline {
-                        state.failed = true;
                         break;
                     }
                     let lease = state.lease.clone();
+                    let deadline = state.deadline;
                     drop(state);
-                    let renewed = client.renew(&lease);
+                    let renewed = client.renew_until(&lease, Some(deadline));
                     let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
                     if state.stopped {
                         break;
                     }
                     match renewed {
-                        Ok(lease) => {
+                        Ok(lease) if Instant::now() < deadline => {
                             state.lease = lease;
-                            state.deadline = Instant::now() + LEASE_TTL;
+                            state.deadline = Instant::now() + ttl;
+                            state.network_error = None;
+                        }
+                        Ok(_) => break,
+                        Err(error) if network::retryable(&error) => {
+                            state.network_error =
+                                error.downcast_ref::<network::Transient>().cloned();
                         }
                         Err(_) => {
                             state.failed = true;
@@ -445,12 +505,6 @@ impl Guard {
     }
 
     pub fn lease(&self) -> Result<Lease> {
-        ensure!(
-            self.worker
-                .as_ref()
-                .is_some_and(|worker| !worker.is_finished()),
-            "Dispatch lease renewal stopped"
-        );
         let state = self
             .state
             .0
@@ -460,7 +514,21 @@ impl Guard {
             !state.failed && !state.stopped,
             "Dispatch lease renewal failed"
         );
-        ensure!(Instant::now() < state.deadline, "Dispatch lease expired");
+        if Instant::now() >= state.deadline {
+            return Err(state
+                .network_error
+                .clone()
+                .unwrap_or_else(|| {
+                    network::Transient("Dispatch lease expired before renewal was confirmed".into())
+                })
+                .into());
+        }
+        ensure!(
+            self.worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished()),
+            "Dispatch lease renewal stopped"
+        );
         Ok(state.lease.clone())
     }
 }
@@ -478,5 +546,48 @@ impl Drop for Guard {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn expired_guard_cannot_supply_a_publish_lease_or_send_a_renewal() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = Client::new(
+            reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+            HeaderValue::from_static("Bearer test"),
+            1,
+            Duration::ZERO,
+        );
+        let lease = Lease {
+            batch_id: "10000000-0000-4000-8000-000000000001".into(),
+            region: "test-region".into(),
+            extract: "europe/germany/berlin".into(),
+            device_id: "20000000-0000-4000-8000-000000000002".into(),
+            slot: 0,
+            token: "30000000-0000-4000-8000-000000000003".into(),
+            generation: 1,
+            expires_at: "2100-01-01T00:00:00Z".into(),
+            renew_after_seconds: 60,
+        };
+        let guard = Guard::start_with_ttl(client, lease, Duration::from_millis(20)).unwrap();
+        thread::sleep(Duration::from_millis(40));
+        let error = guard.lease().err().unwrap();
+        assert!(network::retryable(&error), "{error:#}");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }
