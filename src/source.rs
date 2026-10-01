@@ -9,11 +9,107 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     compute::read_pbf_header,
-    format::{is_region, normalize_timestamp},
+    format::{is_region, normalize_timestamp, validate_coverage},
     storage::atomic_write,
 };
 
 const MAX_SEQUENCE: u64 = 9_007_199_254_740_991;
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum SourceProvider {
+    #[serde(rename = "geofabrik")]
+    Geofabrik,
+    #[serde(rename = "osm-fr")]
+    OsmFrance,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceIdentity {
+    pub provider: SourceProvider,
+    pub replication_url: String,
+}
+
+impl SourceIdentity {
+    pub fn from_replication_url(value: &str) -> Result<Self> {
+        let replication_url = replication_url(value)?;
+        let provider = if replication_url.starts_with("https://download.geofabrik.de/") {
+            SourceProvider::Geofabrik
+        } else {
+            SourceProvider::OsmFrance
+        };
+        let identity = Self {
+            provider,
+            replication_url,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let canonical = replication_url(&self.replication_url)?;
+        let valid_path = match self.provider {
+            SourceProvider::Geofabrik => canonical
+                .strip_prefix("https://download.geofabrik.de/")
+                .and_then(|path| path.strip_suffix("-updates"))
+                .is_some_and(valid_extract),
+            SourceProvider::OsmFrance => canonical
+                .strip_prefix("https://download.openstreetmap.fr/replication/")
+                .and_then(|path| path.strip_suffix("/minute"))
+                .is_some_and(valid_osm_france_extract),
+        };
+        ensure!(
+            canonical == self.replication_url && valid_path,
+            "Source identity does not match its canonical replication URL"
+        );
+        Ok(())
+    }
+
+    pub fn source_url(&self) -> Result<String> {
+        self.validate()?;
+        Ok(match self.provider {
+            SourceProvider::Geofabrik => format!(
+                "{}-latest.osm.pbf",
+                self.replication_url
+                    .strip_suffix("-updates")
+                    .context("Invalid Geofabrik source identity")?
+            ),
+            SourceProvider::OsmFrance => format!(
+                "https://download.openstreetmap.fr/extracts/{}.osm.pbf",
+                self.replication_url
+                    .strip_prefix("https://download.openstreetmap.fr/replication/")
+                    .context("Invalid OSM France source identity")?
+                    .strip_suffix("/minute")
+                    .context("Invalid OSM France source identity")?
+            ),
+        })
+    }
+
+    pub fn checksum_url(&self) -> Result<String> {
+        Ok(format!("{}.md5", self.source_url()?))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FallbackSource {
+    pub region: String,
+    pub geofabrik_extract: String,
+    pub osm_france_extract: String,
+    pub coverage: Value,
+}
+
+impl FallbackSource {
+    pub fn identity(&self) -> SourceIdentity {
+        SourceIdentity {
+            provider: SourceProvider::OsmFrance,
+            replication_url: format!(
+                "https://download.openstreetmap.fr/replication/{}/minute",
+                self.osm_france_extract
+            ),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Region {
@@ -57,6 +153,82 @@ pub(crate) fn valid_extract(extract: &str) -> bool {
         && extract.split('/').all(|part| {
             !part.is_empty() && part.bytes().all(|byte| lower_digit(byte) || byte == b'-')
         })
+}
+
+fn valid_osm_france_extract(extract: &str) -> bool {
+    extract.len() <= 512
+        && extract.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| lower_digit(byte) || matches!(byte, b'-' | b'_'))
+        })
+}
+
+pub fn fallback_sources(path: &Path, regions: &[Region]) -> Result<Vec<FallbackSource>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Configuration {
+        regions: Vec<FallbackSource>,
+    }
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let config: Configuration = serde_json::from_slice(&bytes)?;
+    let mut ids = HashSet::new();
+    let mut extracts = HashSet::new();
+    for source in &config.regions {
+        ensure!(
+            is_region(&source.region)
+                && ids.insert(&source.region)
+                && regions.iter().any(|region| {
+                    region.id == source.region && region.extract == source.geofabrik_extract
+                }),
+            "Fallback source does not match a unique configured region"
+        );
+        ensure!(
+            valid_extract(&source.geofabrik_extract)
+                && valid_osm_france_extract(&source.osm_france_extract)
+                && extracts.insert(&source.osm_france_extract),
+            "Invalid or duplicate fallback extract path"
+        );
+        validate_coverage(&source.coverage)?;
+    }
+    Ok(config.regions)
+}
+
+pub fn fallback_for<'a>(
+    sources: &'a [FallbackSource],
+    region: &Region,
+) -> Option<&'a FallbackSource> {
+    sources
+        .iter()
+        .find(|source| source.region == region.id && source.geofabrik_extract == region.extract)
+}
+
+pub fn prepare_fallback(source: &FallbackSource, output: &Path) -> Result<()> {
+    ensure!(
+        is_region(&source.region)
+            && valid_extract(&source.geofabrik_extract)
+            && valid_osm_france_extract(&source.osm_france_extract),
+        "Invalid fallback source"
+    );
+    validate_coverage(&source.coverage)?;
+    let identity = source.identity();
+    let url = identity.source_url()?;
+    fs::create_dir_all(output)?;
+    atomic_write(
+        &output.join("coverage.json"),
+        &serde_json::to_vec(&source.coverage)?,
+    )?;
+    atomic_write(&output.join("source.url"), format!("{url}\n").as_bytes())?;
+    atomic_write(
+        &output.join("updates.url"),
+        format!("{}\n", identity.replication_url).as_bytes(),
+    )?;
+    Ok(())
 }
 
 pub fn regions(path: &Path) -> Result<Vec<Region>> {
@@ -139,6 +311,36 @@ pub fn prepare(entry: &Region, index: &Path, output: &Path) -> Result<()> {
 }
 
 pub fn replication_url(value: &str) -> Result<String> {
+    if let Some(raw_path) = value
+        .strip_prefix("https://download.openstreetmap.fr")
+        .or_else(|| value.strip_prefix("http://download.openstreetmap.fr"))
+    {
+        ensure!(
+            raw_path.starts_with('/')
+                && raw_path.split('/').all(|part| {
+                    part == "."
+                        || part
+                            .bytes()
+                            .all(|byte| lower_digit(byte) || matches!(byte, b'-' | b'_'))
+                }),
+            "Invalid OSM France replication URL"
+        );
+        let path = raw_path
+            .split('/')
+            .filter(|part| *part != ".")
+            .collect::<Vec<_>>()
+            .join("/");
+        let path = path.trim_end_matches('/');
+        let extract = path
+            .strip_prefix("/replication/")
+            .and_then(|path| path.strip_suffix("/minute"))
+            .context("Invalid OSM France replication URL")?;
+        ensure!(
+            valid_osm_france_extract(extract),
+            "Invalid OSM France replication URL"
+        );
+        return Ok(format!("https://download.openstreetmap.fr{path}"));
+    }
     let raw_path = value
         .strip_prefix("https://download.geofabrik.de")
         .or_else(|| value.strip_prefix("http://download.geofabrik.de"))
@@ -228,11 +430,11 @@ pub fn stamp(pbf: &Path, checksum: &Path, expected_url: &str) -> Result<Snapshot
     let expected = checksum
         .split_whitespace()
         .next()
-        .context("Invalid Geofabrik MD5 file")?
+        .context("Invalid source MD5 file")?
         .to_ascii_lowercase();
     ensure!(
         expected.len() == 32 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "Invalid Geofabrik MD5 file"
+        "Invalid source MD5 file"
     );
     let mut file = fs::File::open(pbf)?;
     let mut md5 = Md5::new();

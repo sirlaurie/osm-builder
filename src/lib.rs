@@ -7,6 +7,7 @@ pub mod incremental;
 pub mod network;
 pub mod pipeline;
 mod progress;
+pub mod promotion;
 pub mod publish;
 pub mod schedule;
 pub mod source;

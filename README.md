@@ -76,6 +76,22 @@ Worker 在同一个 Durable Object 事务中校验租约、合并发布清单并
 
 从单任务版本升级时，停止各设备的旧 Builder，部署配套 Worker，再更新并启动 Builder。云端已有发布数据、批次和租约保留；旧租约归入任务位置 0。旧版领取和释放请求不符合新协议，不能与新版混跑。
 
+## 数据源切换
+
+Geofabrik 为默认来源。`config/fallback-sources.json` 保存通过准入的 OSM France 地区映射；当前 `regions` 为空，真实地区的自动切源尚未启用。已检查的候选未通过覆盖或引用检查，证据见 [准入报告](docs/source-qualification.md)。不能通过填入相似地名启用备用源。
+
+每项映射包含 `region`、`geofabrikExtract`、`osmFranceExtract` 与固定的 `coverage`。启用前须验证备用 PBF 包含已有覆盖范围、way 节点与业务 relation 完整，并完成 POI 分类、分布和边界检查点的影子比较。范围以线上 manifest 为准；通过这些检查后才能保存映射。配置中的 coverage 作为边界版本，索引记录其 SHA-256。
+
+有准入映射时，来源请求重试耗尽会从另一来源建立全量候选。来源身份绑定到本地索引和 manifest，增量只沿原来源的 sequence 前进。快照下载前后检查 MD5，验证完整文件及 PBF 自身的 replication header；快照换代会触发有限次数的整套重取。HTTP 429 使用有效的 `Retry-After`。重定向只能留在同一批准的 HTTPS 主机。
+
+候选保存在数据目录的 `.candidates/<region>`，原索引与线上版本保留。Builder 在上传前读取线上 manifest；跨源要求数据时间更新、coverage 相同、POI 数不减少、缺失业务 relation 数不增加。OSM France 产物还必须非空且没有被排除的业务 relation，手工发布与未发布地区也受此限制。Worker 在发布事务中复核这些跨源门槛、Current 哈希和租约。未通过验收的数据不会替换 Current，也不会清理旧云端对象。
+
+发布确认后，候选通过本地 journal 晋升为活动索引；中断恢复须核对远端 manifest。切源失败的索引各自保留，发布成功后才清理被替换的候选。为保持下载空间预算，有准入映射的地区在计算完成后开放另一任务的预下载。两个来源均传输失败时沿用 60 秒任务重试；派发、上传、磁盘和数据库错误不触发切源。
+
+恢复时若远端已被另一节点推进至不同 manifest，程序保留 journal 和本地目录并停止该地区，需核对版本后处理本地状态；旧 journal 不会覆盖新的线上版本。
+
+升级顺序为：部署配套 Worker、升级所有 Builder、完成地区准入、启用映射。旧 manifest 缺少来源字段时按 Geofabrik 解释；旧节点不能覆盖已切至 OSM France 的地区。查询 API、region ID、POI ID、Current schema 及旧 manifest 的读取契约不变。
+
 ## R2 打包存储
 
 Builder 保留 0.01° 查询网格和每个 POI 的原始数据，将同一 16 × 16 网格组内的小块拼成最大 1 MiB 的不可变包，上传 `packs/<SHA256>.bin` 和地区 manifest。清单记录包目录以及各小块的哈希、包编号、偏移和长度；Worker 按范围读取所需小块。本地 `blocks/` 供增量构建使用，不再逐块上传。

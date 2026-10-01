@@ -1,10 +1,11 @@
 use crate::config::{Environment, Runtime};
 use crate::dispatch::{self, Lease};
 use crate::format::{
-    self, CellPage, Current, MAX_BLOCK, MAX_CURRENT, MAX_MANIFEST, MAX_PACK, Release,
+    self, CellPage, Current, MAX_BLOCK, MAX_CURRENT, MAX_MANIFEST, MAX_PACK, Manifest, Release,
 };
 use crate::network;
 use crate::progress::ProgressLine;
+use crate::source::{SourceIdentity, SourceProvider};
 use crate::storage::{atomic_write, read_bytes, read_local};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use aws_credential_types::Credentials;
@@ -135,6 +136,7 @@ struct Object {
 struct Build {
     root: PathBuf,
     release: Release,
+    manifest: Manifest,
     objects: Vec<Object>,
 }
 
@@ -312,6 +314,7 @@ fn validate_build(
     Ok(Build {
         root,
         release,
+        manifest,
         objects,
     })
 }
@@ -583,6 +586,119 @@ impl Publisher {
         Ok(true)
     }
 
+    pub fn read_manifest(&self, hash: &str, cancelled: &AtomicBool) -> Result<Manifest> {
+        ensure!(format::is_hash(hash), "Invalid remote manifest hash");
+        let object = Object {
+            key: format!("manifests/{hash}.json"),
+            hash: hash.to_owned(),
+            size: MAX_MANIFEST,
+        };
+        for attempt in 0..self.attempts {
+            let response = self.s3_request(Method::GET, &object, None, cancelled)?;
+            ensure!(
+                response.status().is_success(),
+                "R2 manifest read rejected: HTTP {}",
+                response.status().as_u16()
+            );
+            ensure!(
+                response
+                    .content_length()
+                    .is_none_or(|size| size <= MAX_MANIFEST as u64),
+                "Remote manifest is too large"
+            );
+            let mut bytes = Vec::new();
+            match response
+                .take(MAX_MANIFEST as u64 + 1)
+                .read_to_end(&mut bytes)
+            {
+                Ok(_) => {
+                    ensure!(bytes.len() <= MAX_MANIFEST, "Remote manifest is too large");
+                    ensure!(
+                        format::hash_bytes(&bytes) == hash,
+                        "Remote manifest SHA-256 mismatch"
+                    );
+                    let value: Value = serde_json::from_slice(&bytes)
+                        .map_err(|_| anyhow!("Invalid remote manifest JSON"))?;
+                    return format::validate_manifest(&value)
+                        .map_err(|_| anyhow!("Invalid remote manifest schema"));
+                }
+                Err(_) if attempt + 1 == self.attempts => {
+                    return Err(
+                        network::Transient("R2 manifest response read failed".into()).into(),
+                    );
+                }
+                Err(_) => self.backoff(attempt),
+            }
+        }
+        bail!("R2 manifest read has no attempts")
+    }
+
+    fn validate_remote_source(
+        &self,
+        build: &Build,
+        lease: &Lease,
+        cancelled: &AtomicBool,
+    ) -> Result<()> {
+        ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
+        let state = self.read_state()?;
+        let Some(previous) = state.as_ref().and_then(|state| {
+            state
+                .regions
+                .iter()
+                .find(|region| region.region == build.release.region)
+        }) else {
+            return Ok(());
+        };
+        if previous.manifest == build.release.manifest {
+            return Ok(());
+        }
+        let previous_manifest = self.read_manifest(&previous.manifest, cancelled)?;
+        ensure!(
+            previous_manifest.region == previous.region
+                && previous_manifest.source_timestamp == previous.source_timestamp,
+            "Current release does not match its manifest"
+        );
+        let legacy = SourceIdentity::from_replication_url(&format!(
+            "https://download.geofabrik.de/{}-updates",
+            lease.extract
+        ))?;
+        let before = previous_manifest.source.as_ref().unwrap_or(&legacy);
+        let after = build.manifest.source.as_ref().unwrap_or(&legacy);
+        if before == after {
+            return Ok(());
+        }
+        ensure!(
+            build.manifest.source.is_some(),
+            "Source change requires an explicit source declaration"
+        );
+        ensure!(
+            chrono::DateTime::parse_from_rfc3339(&build.manifest.source_timestamp)?
+                > chrono::DateTime::parse_from_rfc3339(&previous_manifest.source_timestamp)?,
+            "Source change requires newer data"
+        );
+        ensure!(
+            build.manifest.coverage["type"] == previous_manifest.coverage["type"]
+                && build.manifest.coverage["coordinates"]
+                    == previous_manifest.coverage["coordinates"],
+            "Source change alters region coverage"
+        );
+        ensure!(
+            build.manifest.count >= previous_manifest.count,
+            "Source change reduces POI count"
+        );
+        ensure!(
+            build
+                .manifest
+                .excluded_incomplete_relation_count
+                .unwrap_or(0)
+                <= previous_manifest
+                    .excluded_incomplete_relation_count
+                    .unwrap_or(0),
+            "Source change increases incomplete relations"
+        );
+        Ok(())
+    }
+
     fn upload(&self, root: &Path, object: &Object, cancelled: &AtomicBool) -> Result<bool> {
         if self.head(object, cancelled)? {
             return Ok(false);
@@ -647,6 +763,36 @@ impl Publisher {
             lease.region == build.release.region,
             "Publication does not match the leased region"
         );
+        if let Some(source) = &build.manifest.source
+            && source.provider == SourceProvider::Geofabrik
+        {
+            ensure!(
+                source.replication_url
+                    == format!("https://download.geofabrik.de/{}-updates", lease.extract),
+                "Geofabrik source does not match the leased extract"
+            );
+        }
+        if build
+            .manifest
+            .source
+            .as_ref()
+            .is_some_and(|source| source.provider == SourceProvider::OsmFrance)
+        {
+            ensure!(
+                build.manifest.count > 0,
+                "OSM France source contains no places"
+            );
+            ensure!(
+                build
+                    .manifest
+                    .excluded_incomplete_relation_count
+                    .unwrap_or(0)
+                    == 0,
+                "OSM France source contains incomplete relations"
+            );
+        }
+        progress(Progress::stage("state"));
+        self.validate_remote_source(&build, lease, cancelled)?;
         let mut stats = Progress {
             completed: Some(0),
             total: Some(build.objects.len()),

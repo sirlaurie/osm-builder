@@ -89,6 +89,32 @@ fn format_trust_boundaries_preserve_worker_constraints() {
     assert!(validate_block(&invalid).is_err());
 }
 
+#[test]
+fn manifest_source_is_optional_but_explicit_identity_must_be_canonical_and_bound() {
+    let mut manifest = packed_manifest();
+    assert!(validate_manifest(&manifest).unwrap().source.is_none());
+    for source in [
+        json!({"provider":"geofabrik","replicationUrl":"https://download.geofabrik.de/europe/france-updates"}),
+        json!({"provider":"osm-fr","replicationUrl":"https://download.openstreetmap.fr/replication/europe/france/minute"}),
+    ] {
+        manifest["source"] = source;
+        let parsed = validate_manifest(&manifest).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), manifest);
+    }
+    for source in [
+        Value::Null,
+        json!({"provider":"unknown","replicationUrl":"https://download.geofabrik.de/europe/france-updates"}),
+        json!({"provider":"osm-fr","replicationUrl":"https://download.geofabrik.de/europe/france-updates"}),
+        json!({"provider":"geofabrik","replicationUrl":"https://download.openstreetmap.fr/replication/europe/france/minute"}),
+        json!({"provider":"osm-fr","replicationUrl":"http://download.openstreetmap.fr/replication/./europe/france/minute"}),
+        json!({"provider":"geofabrik","replicationUrl":"https://download.geofabrik.de/europe/france-updates/"}),
+        json!({"provider":"osm-fr","replicationUrl":"https://evil.test/replication/europe/france/minute"}),
+    ] {
+        manifest["source"] = source;
+        assert!(validate_manifest(&manifest).is_err());
+    }
+}
+
 fn packed_manifest() -> Value {
     let hashes = ['a', 'b', 'c', 'd', 'e'].map(|letter| letter.to_string().repeat(64));
     let pages: Vec<_> = hashes

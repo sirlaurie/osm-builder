@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use flate2::read::MultiGzDecoder;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -13,6 +13,7 @@ use crate::compute;
 use crate::format::{
     MAX_ID, canonical_json, hash_bytes, normalize_timestamp, read_coverage, source_metadata,
 };
+use crate::source::SourceIdentity;
 use crate::storage::atomic_write;
 
 #[derive(Clone, Debug)]
@@ -76,11 +77,36 @@ fn load_control(connection: &Connection) -> Result<(Value, String, Value)> {
         )
         .optional()?;
     let (metadata, url, receipt) = record.context("State initialization is incomplete")?;
-    Ok((
-        serde_json::from_str(&metadata)?,
-        url,
-        serde_json::from_str(&receipt)?,
-    ))
+    let metadata = serde_json::from_str(&metadata)?;
+    stored_source_identity(&metadata, &url)?;
+    Ok((metadata, url, serde_json::from_str(&receipt)?))
+}
+
+fn stored_source_identity(metadata: &Value, url: &str) -> Result<SourceIdentity> {
+    let identity = SourceIdentity::from_replication_url(url)?;
+    if let Some(source) = metadata.get("source") {
+        let source: SourceIdentity =
+            serde_json::from_value(source.clone()).context("Invalid stored source identity")?;
+        source.validate()?;
+        ensure!(
+            source == identity,
+            "Stored source identity does not match the replication URL"
+        );
+    } else {
+        ensure!(
+            identity.provider == crate::source::SourceProvider::Geofabrik,
+            "Non-Geofabrik index requires an explicit stored source identity"
+        );
+    }
+    Ok(identity)
+}
+
+pub fn source_identity(state: &Path) -> Result<SourceIdentity> {
+    let state = state_path(state, false)?;
+    let connection =
+        Connection::open_with_flags(state.join("state.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let (metadata, url, _) = load_control(&connection)?;
+    stored_source_identity(&metadata, &url)
 }
 
 fn export_committed(connection: &Connection, state: &Path) -> Result<Value> {
@@ -96,6 +122,9 @@ fn export_committed(connection: &Connection, state: &Path) -> Result<Value> {
     result.insert("sequence".to_owned(), metadata["sourceSequence"].clone());
     result.insert("timestamp".to_owned(), metadata["sourceTimestamp"].clone());
     result.insert("replicationUrl".to_owned(), json!(url));
+    if let Some(source) = metadata.get("source") {
+        result.insert("source".to_owned(), source.clone());
+    }
     result.insert(
         "coverageSHA256".to_owned(),
         json!(hash_bytes(&canonical_json(&metadata["coverage"])?)),
@@ -149,7 +178,7 @@ fn upgrade_packing(connection: &Connection, state: &Path) -> Result<()> {
 
 pub fn initialize(options: &InitOptions, compute: &ComputeOptions) -> Result<Value> {
     compute.validate()?;
-    let metadata = source_metadata(
+    let mut metadata = source_metadata(
         &options.coverage,
         &options.region,
         &options.source_timestamp,
@@ -157,6 +186,8 @@ pub fn initialize(options: &InitOptions, compute: &ComputeOptions) -> Result<Val
         &options.source_sha256,
     )?;
     let replication_url = crate::source::replication_url(&options.replication_url)?;
+    metadata["source"] =
+        serde_json::to_value(SourceIdentity::from_replication_url(&replication_url)?)?;
     let state = state_path(&options.state, true)?;
     let database = state.join("state.sqlite");
     let output = state.join("output");

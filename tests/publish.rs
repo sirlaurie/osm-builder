@@ -400,6 +400,7 @@ struct Remote {
     release: Value,
     current: Value,
     objects: HashMap<String, (usize, Option<String>)>,
+    manifests: HashMap<String, Vec<u8>>,
     state_replies: VecDeque<Reply>,
     put_status: Option<u16>,
     race: Option<u16>,
@@ -415,11 +416,23 @@ struct Remote {
 }
 
 impl Remote {
+    fn seed_manifest(&mut self, manifest: &Value) {
+        let bytes = serde_json::to_vec(manifest).unwrap();
+        let hash = hash_bytes(&bytes);
+        self.manifests
+            .insert(format!("manifests/{hash}.json"), bytes);
+        self.current = json!({ "schema": 1, "revision": REVISION, "regions": [{
+            "region": manifest["region"], "manifest": hash,
+            "sourceTimestamp": manifest["sourceTimestamp"], "bbox": [-1,-1,1,1]
+        }] });
+    }
+
     fn new(build: &Build) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             release: build.release.clone(),
             current: Value::Null,
             objects: HashMap::new(),
+            manifests: HashMap::new(),
             state_replies: VecDeque::new(),
             put_status: None,
             race: None,
@@ -521,6 +534,15 @@ impl Remote {
             request.headers.get("x-amz-content-sha256").unwrap(),
             &hash_bytes(&request.body)
         );
+        if request.method == "GET" {
+            return self.manifests.get(key).map_or_else(
+                || Reply::status(404),
+                |bytes| Reply {
+                    body: bytes.clone(),
+                    ..Reply::status(200)
+                },
+            );
+        }
         if request.method == "HEAD" {
             return match self.objects.get(key) {
                 None => Reply::status(404),
@@ -570,6 +592,9 @@ impl Remote {
                 key.to_owned(),
                 (request.body.len(), Some(hash_bytes(&request.body))),
             );
+            if key.starts_with("manifests/") {
+                self.manifests.insert(key.to_owned(), request.body.clone());
+            }
         }
         if self.lost_put {
             self.lost_put = false;
@@ -579,6 +604,233 @@ impl Remote {
             };
         }
         Reply::status(self.race.unwrap_or(200))
+    }
+}
+
+fn france_source() -> Value {
+    json!({ "provider": "osm-fr", "replicationUrl": "https://download.openstreetmap.fr/replication/europe/germany/berlin/minute" })
+}
+
+#[test]
+fn unpublished_osm_france_candidates_require_places_and_complete_relations_before_network() {
+    for (count, excluded, message) in [(0, 0, "no places"), (1, 1, "incomplete relations")] {
+        let mut candidate = Build::new(count);
+        candidate.manifest["source"] = france_source();
+        candidate.manifest["excludedIncompleteRelationCount"] = json!(excluded);
+        candidate.save_manifest();
+        let server = Server::new(|_| panic!("unqualified candidate contacted network"));
+        let error = publisher(&server, &[])
+            .publish(candidate.path(), &lease(), |_| {})
+            .unwrap_err();
+        assert!(error.to_string().contains(message), "{error:#}");
+        assert!(server.events().is_empty());
+        assert!(!candidate.path().join("publish-receipt.json").exists());
+    }
+}
+
+#[test]
+fn geofabrik_extract_mismatch_fails_before_network_for_an_unpublished_region() {
+    let mut candidate = Build::new(1);
+    candidate.manifest["source"] = json!({
+        "provider": "geofabrik",
+        "replicationUrl": "https://download.geofabrik.de/europe/latvia-updates"
+    });
+    candidate.save_manifest();
+    let server = Server::new(|_| panic!("mismatched source contacted network"));
+    let error = publisher(&server, &[])
+        .publish(candidate.path(), &lease(), |_| {})
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Geofabrik source does not match the leased extract")
+    );
+    assert!(server.events().is_empty());
+    assert!(!candidate.path().join("publish-receipt.json").exists());
+}
+
+#[test]
+fn remote_manifest_body_truncation_retries_the_signed_read() {
+    let previous = Build::new(1);
+    let remote = Remote::new(&previous);
+    remote.lock().unwrap().seed_manifest(&previous.manifest);
+    let truncated = AtomicBool::new(false);
+    let server = Server::new(move |request| {
+        let reply = remote.lock().unwrap().handle(request);
+        if !truncated.swap(true, Ordering::SeqCst) {
+            Reply {
+                headers: vec![("Content-Length".into(), "100".into())],
+                body: b"{".to_vec(),
+                ..Reply::status(200)
+            }
+        } else {
+            reply
+        }
+    });
+    let manifest = publisher(&server, &[])
+        .read_manifest(
+            previous.release["manifest"].as_str().unwrap(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(manifest.count, 1);
+    assert_eq!(
+        server.events(),
+        vec![("GET".into(), format!("/osm-test/{}", previous.manifest_key)); 2]
+    );
+}
+
+#[test]
+fn source_changes_fail_before_upload_when_the_current_release_would_regress() {
+    for (case, message) in [
+        ("same_time", "newer data"),
+        ("old_time", "newer data"),
+        ("coverage", "region coverage"),
+        ("count", "POI count"),
+        ("relations", "incomplete relations"),
+        ("undeclared", "explicit source"),
+        ("replication", "newer data"),
+    ] {
+        let mut candidate = Build::new(1);
+        let mut previous = Build::new(if case == "count" { 2 } else { 1 });
+        candidate.manifest["source"] = france_source();
+        candidate.manifest["sourceTimestamp"] = json!("2026-09-11T00:00:00Z");
+        match case {
+            "same_time" => {
+                candidate.manifest["sourceTimestamp"] = previous.manifest["sourceTimestamp"].clone()
+            }
+            "old_time" => candidate.manifest["sourceTimestamp"] = json!("2026-09-09T00:00:00Z"),
+            "coverage" => {
+                candidate.manifest["coverage"]["coordinates"] =
+                    json!([[[-2, -1], [1, -1], [1, 1], [-2, 1], [-2, -1]]])
+            }
+            "relations" => candidate.manifest["excludedIncompleteRelationCount"] = json!(1),
+            "undeclared" => {
+                previous.manifest["source"] = france_source();
+                candidate.manifest.as_object_mut().unwrap().remove("source");
+            }
+            "replication" => {
+                previous.manifest["source"] = france_source();
+                previous.manifest["source"]["replicationUrl"] = json!(
+                    "https://download.openstreetmap.fr/replication/europe/germany/other/minute"
+                );
+                candidate.manifest["sourceTimestamp"] =
+                    previous.manifest["sourceTimestamp"].clone();
+            }
+            _ => {}
+        }
+        candidate.save_manifest();
+        let remote = Remote::new(&candidate);
+        remote.lock().unwrap().seed_manifest(&previous.manifest);
+        let before = remote.lock().unwrap().current.clone();
+        let server = Remote::server(&remote);
+        let error = publisher(&server, &[])
+            .publish(candidate.path(), &lease(), |_| {})
+            .unwrap_err();
+        assert!(error.to_string().contains(message), "{case}: {error:#}");
+        assert!(
+            server.events().iter().all(|(method, _)| method == "GET"),
+            "{case}"
+        );
+        assert_eq!(remote.lock().unwrap().current, before);
+        assert!(!candidate.path().join("publish-receipt.json").exists());
+    }
+}
+
+#[test]
+fn newer_cross_source_release_uploads_after_signed_baseline_validation() {
+    let previous = Build::new(1);
+    let mut candidate = Build::packed(1);
+    candidate.manifest["source"] = france_source();
+    candidate.manifest["sourceTimestamp"] = json!("2026-09-11T00:00:00Z");
+    candidate.manifest["excludedIncompleteRelationCount"] = json!(0);
+    candidate.save_manifest();
+    let remote = Remote::new(&candidate);
+    remote.lock().unwrap().seed_manifest(&previous.manifest);
+    let server = Remote::server(&remote);
+    publisher(&server, &[])
+        .publish(candidate.path(), &lease(), |_| {})
+        .unwrap();
+    assert_eq!(
+        &server.events()[..2],
+        &[
+            ("GET".into(), "/admin/state".into()),
+            ("GET".into(), format!("/osm-test/{}", previous.manifest_key)),
+        ]
+    );
+    let remote = remote.lock().unwrap();
+    assert_eq!(
+        remote.current["regions"][0]["manifest"],
+        candidate.release["manifest"]
+    );
+    assert_eq!(
+        remote.manifests[&previous.manifest_key],
+        serde_json::to_vec(&previous.manifest).unwrap()
+    );
+}
+
+#[test]
+fn geofabrik_source_declarations_remain_compatible_with_legacy_repacking() {
+    for declared_candidate in [false, true] {
+        let mut previous = Build::new(1);
+        let mut candidate = Build::packed(1);
+        let source = json!({ "provider": "geofabrik", "replicationUrl": "https://download.geofabrik.de/europe/germany/berlin-updates" });
+        if declared_candidate {
+            candidate.manifest["source"] = source;
+        } else {
+            previous.manifest["source"] = source;
+        }
+        candidate.save_manifest();
+        let remote = Remote::new(&candidate);
+        remote.lock().unwrap().seed_manifest(&previous.manifest);
+        let server = Remote::server(&remote);
+        publisher(&server, &[])
+            .publish(candidate.path(), &lease(), |_| {})
+            .unwrap();
+    }
+}
+
+#[test]
+fn invalid_remote_manifests_prevent_uploads() {
+    for case in ["hash", "size", "schema", "mismatch"] {
+        let mut candidate = Build::new(1);
+        candidate.manifest["source"] = france_source();
+        candidate.save_manifest();
+        let remote = Remote::new(&candidate);
+        let mut previous = Build::new(0).manifest;
+        if case == "schema" {
+            previous["schema"] = json!(0);
+        }
+        if case == "mismatch" {
+            previous["region"] = json!("other");
+        }
+        {
+            let mut remote = remote.lock().unwrap();
+            remote.seed_manifest(&previous);
+            remote.current["regions"][0]["region"] = json!("test-region");
+            let key = format!(
+                "manifests/{}.json",
+                remote.current["regions"][0]["manifest"].as_str().unwrap()
+            );
+            if case == "hash" {
+                remote.manifests.insert(key, b"{}".to_vec());
+            } else if case == "size" {
+                remote
+                    .manifests
+                    .insert(key, vec![b' '; aura_osm::format::MAX_MANIFEST + 1]);
+            }
+        }
+        let server = Remote::server(&remote);
+        assert!(
+            publisher(&server, &[])
+                .publish(candidate.path(), &lease(), |_| {})
+                .is_err(),
+            "{case}"
+        );
+        assert!(
+            server.events().iter().all(|(method, _)| method == "GET"),
+            "{case}"
+        );
     }
 }
 
@@ -606,7 +858,9 @@ fn validates_uploads_blocks_then_manifest_publishes_and_resumes() {
             .iter()
             .map(|(method, _)| method.as_str())
             .collect::<Vec<_>>(),
-        ["HEAD", "PUT", "HEAD", "HEAD", "PUT", "HEAD", "POST", "GET"]
+        [
+            "GET", "HEAD", "PUT", "HEAD", "HEAD", "PUT", "HEAD", "POST", "GET"
+        ]
     );
     let puts: Vec<_> = server
         .events()
@@ -1038,6 +1292,9 @@ fn concurrent_upload_rejection_is_not_hidden_by_network_failure() {
     let network_path = format!("/osm-test/{}", build.keys[0]);
     let uploads = std::sync::Barrier::new(2);
     let server = Server::new(move |request| {
+        if request.path == "/admin/state" {
+            return Reply::json(&Value::Null);
+        }
         if request.method == "HEAD" {
             return Reply::status(404);
         }
@@ -1091,8 +1348,16 @@ fn publication_uses_the_same_lease_after_other_regions_change() {
             let kept = region_release("kept-region", &"b".repeat(64));
             let other = region_release("other-region", &"c".repeat(64));
             let mut regions = vec![kept.clone()];
+            let previous = Build::new(0);
             if existing {
-                regions.push(region_release("test-region", &"a".repeat(64)));
+                regions.push(region_release(
+                    "test-region",
+                    previous.release["manifest"].as_str().unwrap(),
+                ));
+                remote.lock().unwrap().manifests.insert(
+                    previous.manifest_key.clone(),
+                    serde_json::to_vec(&previous.manifest).unwrap(),
+                );
             }
             {
                 let mut remote = remote.lock().unwrap();
@@ -1150,7 +1415,7 @@ fn publication_fences_a_reassigned_lease_without_retrying() {
     let build = Build::new(0);
     let remote = Remote::new(&build);
     let concurrent = json!({ "schema": 1, "revision": NEW_REVISION,
-        "regions": [region_release("test-region", &"d".repeat(64))] });
+        "regions": [region_release("test-region", build.release["manifest"].as_str().unwrap())] });
     {
         let mut remote = remote.lock().unwrap();
         remote.current = concurrent.clone();
@@ -1248,11 +1513,13 @@ fn publication_existing_manifest_requires_a_completion_acknowledgement() {
         if transient {
             assert_eq!(remote.publish_leases[0], remote.publish_leases[1]);
         }
-        assert!(
-            !server
+        assert_eq!(
+            server
                 .events()
                 .iter()
-                .any(|(_, path)| path == "/admin/state")
+                .filter(|(_, path)| path == "/admin/state")
+                .count(),
+            1
         );
         assert!(
             !progress
@@ -1624,7 +1891,9 @@ fn cancellation_during_head_does_not_start_put_or_change_local_artifacts() {
     let cancel = Arc::new(AtomicBool::new(false));
     let handler_cancel = Arc::clone(&cancel);
     let server = Server::new(move |request| {
-        if request.method == "HEAD" {
+        if request.path == "/admin/state" {
+            Reply::json(&Value::Null)
+        } else if request.method == "HEAD" {
             handler_cancel.store(true, Ordering::SeqCst);
             Reply::status(404)
         } else {
@@ -1637,7 +1906,10 @@ fn cancellation_during_head_does_not_start_put_or_change_local_artifacts() {
     assert!(error.to_string().contains("Publication cancelled"));
     assert_eq!(
         server.events(),
-        [("HEAD".to_owned(), format!("/osm-test/{}", build.keys[0]))]
+        [
+            ("GET".to_owned(), "/admin/state".to_owned()),
+            ("HEAD".to_owned(), format!("/osm-test/{}", build.keys[0]))
+        ]
     );
     for (key, bytes) in artifacts {
         assert_eq!(fs::read(build.path().join(key)).unwrap(), bytes);

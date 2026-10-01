@@ -32,6 +32,12 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_replication_url(
+            "https://download.geofabrik.de/australia-oceania/australia/new-south-wales-updates",
+        )
+    }
+
+    fn with_replication_url(replication_url: &str) -> Self {
         let work = common::work("incremental-");
         let state = work.path().join("state");
         let input = common::write_pbf(work.path(), "source", SNAPSHOT, &[]);
@@ -45,9 +51,7 @@ impl Fixture {
             region: "au-nsw".into(),
             source_timestamp: "2020-01-01T00:00:00Z".into(),
             source_sequence: 10,
-            replication_url:
-                "https://download.geofabrik.de/australia-oceania/australia/new-south-wales-updates"
-                    .into(),
+            replication_url: replication_url.into(),
         };
         let compute = ComputeOptions {
             workers: 2,
@@ -365,7 +369,21 @@ fn initialization_matches_full_build_and_retains_geometry_without_unselected_tag
         &fixture.compute,
     )
     .unwrap();
-    assert_eq!(status["manifest"], fresh["manifest"]);
+    let expected_source =
+        json!({"provider":"geofabrik","replicationUrl":fixture.init.replication_url});
+    assert_eq!(status["source"], expected_source);
+    let (mut initialized, _) = fixture.snapshot();
+    assert_eq!(initialized["source"], expected_source);
+    initialized.as_object_mut().unwrap().remove("source");
+    let fresh_manifest: Value = serde_json::from_slice(
+        &fs::read(fixture.work.path().join(format!(
+            "fresh/manifests/{}.json",
+            fresh["manifest"].as_str().unwrap()
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(initialized, fresh_manifest);
     let stored: (String, f64) = fixture
         .database()
         .query_row(
@@ -803,6 +821,7 @@ fn installed_version_one_state_from_previous_engine_can_be_read_and_updated() {
     let before = incremental::status(&state, &compute).unwrap();
     assert_eq!(before["sequence"], 10);
     assert_eq!(before["count"], 1);
+    assert!(before.get("source").is_none());
     let input = work.path().join("change.osc");
     fs::write(&input, r#"<osmChange><modify><node id="1" version="2" lat="-33.5" lon="151.5"><tag k="name" v="Updated Cafe"/><tag k="amenity" v="cafe"/></node></modify></osmChange>"#).unwrap();
     let after = incremental::apply_diff(
@@ -818,6 +837,7 @@ fn installed_version_one_state_from_previous_engine_can_be_read_and_updated() {
     .unwrap();
     assert_eq!(after["sequence"], 11);
     assert_eq!(after["count"], 1);
+    assert!(after.get("source").is_none());
     let manifest: Value = serde_json::from_slice(
         &fs::read(state.join(format!(
             "output/manifests/{}.json",
@@ -826,6 +846,7 @@ fn installed_version_one_state_from_previous_engine_can_be_read_and_updated() {
         .unwrap(),
     )
     .unwrap();
+    assert!(manifest.get("source").is_none());
     let cells = manifest["cells"].as_object().unwrap();
     assert_eq!(cells.len(), 1);
     let digest = cells.values().next().unwrap()[0][0].as_str().unwrap();
@@ -836,4 +857,112 @@ fn installed_version_one_state_from_previous_engine_can_be_read_and_updated() {
     assert_eq!(records[0]["tags"]["name"], "Updated Cafe");
     assert_eq!(records[0]["lat"], -33.5);
     assert_eq!(records[0]["lon"], 151.5);
+}
+
+#[test]
+fn osm_france_initialized_index_retains_its_identity_after_diff() {
+    let fixture = Fixture::with_replication_url(
+        "http://download.openstreetmap.fr/replication/./oceania/australia/new_south_wales/minute",
+    );
+    let expected = json!({"provider":"osm-fr","replicationUrl":"https://download.openstreetmap.fr/replication/oceania/australia/new_south_wales/minute"});
+    assert_eq!(fixture.status()["source"], expected);
+    assert_eq!(
+        serde_json::to_value(incremental::source_identity(&fixture.state).unwrap()).unwrap(),
+        expected
+    );
+    let updated = fixture.change("", 11).unwrap();
+    assert_eq!(updated["source"], expected);
+    assert_eq!(fixture.snapshot().0["source"], expected);
+}
+
+#[test]
+fn source_identity_reads_legacy_index_without_upgrading_or_exporting() {
+    let work = common::work("legacy-source-identity-");
+    let state = work.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let path = state.join("state.sqlite");
+    let database = Connection::open(&path).unwrap();
+    database
+        .execute_batch(include_str!("fixtures/installed-state-v1.sql"))
+        .unwrap();
+    database.close().unwrap();
+    let before = fs::read(&path).unwrap();
+    let identity = incremental::source_identity(&state).unwrap();
+    assert_eq!(
+        identity.provider,
+        aura_osm::source::SourceProvider::Geofabrik
+    );
+    assert_eq!(
+        identity.replication_url,
+        "https://download.geofabrik.de/australia-oceania/australia/new-south-wales-updates"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!state.join("output").exists());
+}
+
+#[test]
+fn mismatched_stored_source_rejects_identity_reads_and_diff_without_advancing_state() {
+    let fixture = Fixture::new();
+    let database = fixture.database();
+    let before: (String, String) = database
+        .query_row(
+            "SELECT metadata,receipt FROM control WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE control SET replication_url=? WHERE id=1",
+            ["https://download.openstreetmap.fr/replication/oceania/australia/new_south_wales/minute"],
+        )
+        .unwrap();
+    assert!(incremental::source_identity(&fixture.state).is_err());
+    assert!(fixture.change("", 11).is_err());
+    let after: (String, String) = database
+        .query_row(
+            "SELECT metadata,receipt FROM control WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn osm_france_index_without_explicit_source_cannot_be_read_or_updated_as_legacy() {
+    let fixture = Fixture::with_replication_url(
+        "https://download.openstreetmap.fr/replication/oceania/australia/new_south_wales/minute",
+    );
+    let database = fixture.database();
+    let stored: String = database
+        .query_row("SELECT metadata FROM control WHERE id=1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut metadata: Value = serde_json::from_str(&stored).unwrap();
+    metadata.as_object_mut().unwrap().remove("source");
+    let legacy_metadata = serde_json::to_string(&metadata).unwrap();
+    database
+        .execute(
+            "UPDATE control SET metadata=? WHERE id=1",
+            [&legacy_metadata],
+        )
+        .unwrap();
+    let release = fs::read(fixture.state.join("output/release.json")).unwrap();
+    assert!(incremental::source_identity(&fixture.state).is_err());
+    assert!(incremental::status(&fixture.state, &fixture.compute).is_err());
+    assert!(fixture.change("", 11).is_err());
+    assert_eq!(
+        database
+            .query_row("SELECT metadata FROM control WHERE id=1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        legacy_metadata
+    );
+    assert_eq!(
+        fs::read(fixture.state.join("output/release.json")).unwrap(),
+        release
+    );
 }

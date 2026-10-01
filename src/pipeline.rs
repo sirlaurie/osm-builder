@@ -20,7 +20,7 @@ use crate::{
     config::{Environment, Runtime},
     dispatch, format, incremental, progress,
     publish::{ProgressReporter, PublishConfig, Publisher},
-    source::{self, Region, ReplicationState},
+    source::{self, FallbackSource, Region, ReplicationState, SourceIdentity, SourceProvider},
     storage::{atomic_write, sync_directory},
 };
 
@@ -102,6 +102,18 @@ impl Downloader {
             .redirect(Policy::custom(|attempt| {
                 if attempt.url().scheme() != "https" {
                     attempt.error("Downloads require HTTPS redirects")
+                } else if !matches!(
+                    attempt.url().host_str(),
+                    Some("download.geofabrik.de" | "download.openstreetmap.fr")
+                ) || !attempt.url().username().is_empty()
+                    || attempt.url().password().is_some()
+                    || attempt.url().port().is_some()
+                    || attempt
+                        .previous()
+                        .first()
+                        .is_some_and(|url| url.host_str() != attempt.url().host_str())
+                {
+                    attempt.error("Downloads require an approved source host")
                 } else if attempt.previous().len() >= 10 {
                     attempt.error(crate::network::Transient(
                         "Too many download redirects".into(),
@@ -154,7 +166,10 @@ impl Downloader {
                         fs::rename(&partial, path)?;
                         return Ok(());
                     }
-                    Err(error) if attempt < runtime.download_retries => {
+                    Err(error)
+                        if attempt < runtime.download_retries
+                            && crate::network::retryable(&error) =>
+                    {
                         self.check_cancelled()?;
                         progress::message(&format!(
                             "Download attempt {} failed: {error}",
@@ -279,7 +294,17 @@ impl Downloader {
             ))
             .await?
             .map_err(|_| crate::network::Transient("Download request timed out".into()))?
-            .map_err(crate::network::request)?
+            .map_err(crate::network::request)?;
+        if response.status().as_u16() == 429
+            && let Some(delay) = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(retry_after)
+        {
+            self.interruptible(tokio::time::sleep(delay)).await?;
+        }
+        response = response
             .error_for_status()
             .map_err(crate::network::request)?;
         if let (Some(length), Some(limit)) = (response.content_length(), limit) {
@@ -362,17 +387,78 @@ impl Downloader {
         catalog: &Path,
         job: &Path,
     ) -> Result<()> {
+        if !catalog.try_exists()? {
+            self.download(runtime, INDEX_URL, catalog, Some(64 * 1024 * 1024))?;
+        }
         source::prepare(entry, catalog, job)?;
         let url = entry.source_url();
         progress::message(&format!("[{}] Downloading initial source: {url}", entry.id));
-        self.download(runtime, &url, &job.join("source.osm.pbf"), None)?;
-        self.download(
+        self.snapshot(
             runtime,
-            &format!("{url}.md5"),
-            &job.join("source.md5"),
-            Some(4096),
+            &SourceIdentity::from_replication_url(&entry.updates_url())?,
+            job,
         )
     }
+
+    fn fallback_snapshot(
+        &self,
+        runtime: &Runtime,
+        source: &FallbackSource,
+        job: &Path,
+    ) -> Result<()> {
+        source::prepare_fallback(source, job)?;
+        self.snapshot(runtime, &source.identity(), job)
+    }
+
+    fn snapshot(&self, runtime: &Runtime, identity: &SourceIdentity, job: &Path) -> Result<()> {
+        let checksum = identity.checksum_url()?;
+        for attempt in 0..=runtime.download_retries {
+            self.download(runtime, &checksum, &job.join("before.md5"), Some(4096))?;
+            self.download(
+                runtime,
+                &identity.source_url()?,
+                &job.join("source.osm.pbf"),
+                None,
+            )?;
+            self.download(runtime, &checksum, &job.join("source.md5"), Some(4096))?;
+            if fs::read(job.join("before.md5"))? != fs::read(job.join("source.md5"))? {
+                if attempt == runtime.download_retries {
+                    return Err(crate::network::Transient(
+                        "Source snapshot changed during download".into(),
+                    )
+                    .into());
+                }
+                continue;
+            }
+            let stamp = source::stamp(
+                &job.join("source.osm.pbf"),
+                &job.join("source.md5"),
+                &identity.replication_url,
+            );
+            if let Err(error) = stamp {
+                if attempt == runtime.download_retries {
+                    return Err(error);
+                }
+                self.executor().block_on(async {
+                    self.interruptible(tokio::time::sleep(runtime.download_retry_delay))
+                        .await
+                })?;
+                continue;
+            }
+            return Ok(());
+        }
+        unreachable!()
+    }
+}
+
+fn retry_after(value: &str) -> Option<Duration> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+        .to_std()
+        .ok()
 }
 
 impl Drop for Downloader {
@@ -402,9 +488,11 @@ fn status(entry: &Region, data: &Path, runtime: &Runtime) -> Result<Value> {
         entry.id
     );
     let current = incremental::status(&state, &runtime.compute_options())?;
+    let identity = incremental::source_identity(&state)?;
     ensure!(
         string(&current, "region")? == entry.id
-            && string(&current, "replicationUrl")? == entry.updates_url(),
+            && (identity.provider != SourceProvider::Geofabrik
+                || identity.replication_url == entry.updates_url()),
         "Incremental index does not match the configured regional source"
     );
     Ok(current)
@@ -419,6 +507,7 @@ struct Operations<'a> {
     publisher: Option<Publisher>,
     lease: Option<&'a dispatch::Guard>,
     prefetch: Option<Prefetch>,
+    source: Option<&'a FallbackSource>,
 }
 
 struct Prefetch {
@@ -436,6 +525,7 @@ impl Prefetch {
             catalog,
             data,
             Arc::new(DownloadControl::default()),
+            false,
         )
     }
 
@@ -445,6 +535,7 @@ impl Prefetch {
         catalog: &Path,
         data: &Path,
         control: Arc<DownloadControl>,
+        retry_elsewhere: bool,
     ) -> Self {
         let thread_control = Arc::clone(&control);
         let runtime = runtime.clone();
@@ -470,13 +561,14 @@ impl Prefetch {
                     let mut downloader = Downloader::new(&runtime)?;
                     downloader.control = Some(Arc::clone(&thread_control));
                     downloader.source_snapshot(&runtime, &entry, &catalog, job.path())?;
-                    if let Some((flow, slot)) = pipeline.as_ref() {
+                    if !retry_elsewhere && let Some((flow, slot)) = pipeline.as_ref() {
                         flow.sources_ready.lock().expect("source readiness lock")[*slot] = true;
                         flow.changed.notify_all();
                     }
                     Ok(job)
                 })();
                 if let Err(error) = &result
+                    && !retry_elsewhere
                     && !thread_control.cancelled.load(Ordering::Acquire)
                     && let Some((flow, _)) = &thread_control.pipeline
                 {
@@ -568,6 +660,14 @@ impl Operations<'_> {
             Some(job) => job.canonicalize()?,
             None if pending.is_some() => pending.expect("Prefetch target matches").consume()?,
             None => {
+                let pipeline = self
+                    .downloader
+                    .control
+                    .as_ref()
+                    .and_then(|control| control.pipeline.clone());
+                let _download = pipeline
+                    .as_ref()
+                    .map(|(flow, _)| flow.download.lock().expect("download lock"));
                 let downloads = data.join(".downloads");
                 fs::create_dir_all(&downloads)?;
                 let job = tempfile::Builder::new()
@@ -575,13 +675,19 @@ impl Operations<'_> {
                     .rand_bytes(10)
                     .tempdir_in(&downloads)?
                     .keep();
-                self.downloader
-                    .source_snapshot(self.runtime, entry, &self.catalog, &job)?;
+                if let Some(source) = self.source {
+                    self.downloader
+                        .fallback_snapshot(self.runtime, source, &job)?;
+                } else {
+                    self.downloader
+                        .source_snapshot(self.runtime, entry, &self.catalog, &job)?;
+                }
                 job
             }
         };
         ensure!(
-            fs::read_to_string(job.join("source.url"))?.trim() == entry.source_url(),
+            fs::read_to_string(job.join("source.url"))?.trim()
+                == self.identity(entry)?.source_url()?,
             "Downloaded job does not match the configured regional source"
         );
         let pbf = job.join("source.osm.pbf");
@@ -589,7 +695,11 @@ impl Operations<'_> {
             "[{}] Checking complete source and replication header",
             entry.id
         ));
-        let metadata = source::stamp(&pbf, &job.join("source.md5"), &entry.updates_url())?;
+        let metadata = source::stamp(
+            &pbf,
+            &job.join("source.md5"),
+            &self.identity(entry)?.replication_url,
+        )?;
         let work = tempfile::Builder::new().prefix("init-").tempdir_in(data)?;
         let anchor = self.downloader.remote_state(
             self.runtime,
@@ -638,6 +748,10 @@ impl Operations<'_> {
     fn update(&self, entry: &Region, data: &Path) -> Result<Value> {
         self.check_disks(data, self.runtime.min_free_gib)?;
         let mut current = status(entry, data, self.runtime)?;
+        ensure!(
+            incremental::source_identity(&data.join(&entry.id))? == self.identity(entry)?,
+            "Incremental index does not match the configured regional source"
+        );
         let work = tempfile::Builder::new()
             .prefix("replication-")
             .tempdir_in(data)?;
@@ -660,17 +774,36 @@ impl Operations<'_> {
             "Regional replication sequence or timestamp regressed"
         );
         let pending = latest.sequence - anchor.sequence;
-        source::prepare(entry, &self.catalog, work.path())?;
+        if let Some(source) = self.source {
+            source::prepare_fallback(source, work.path())?;
+        } else {
+            if !self.catalog.try_exists()? {
+                self.downloader.download(
+                    self.runtime,
+                    INDEX_URL,
+                    &self.catalog,
+                    Some(64 * 1024 * 1024),
+                )?;
+            }
+            source::prepare(entry, &self.catalog, work.path())?;
+        }
         let coverage_path = work.path().join("coverage.json");
         let coverage_hash = format::hash_bytes(&format::canonical_json(&format::read_coverage(
             &coverage_path,
         )?)?);
-        ensure!(
-            pending != 0 || string(&current, "coverageSHA256")? == coverage_hash,
-            "Catalog coverage changed without a new regional replication sequence; wait for the next extract"
-        );
+        if self.source.is_some() {
+            ensure!(
+                string(&current, "coverageSHA256")? == coverage_hash,
+                "Approved fallback coverage changed; the index requires a newly qualified full snapshot"
+            );
+        } else {
+            ensure!(
+                pending != 0 || string(&current, "coverageSHA256")? == coverage_hash,
+                "Catalog coverage changed without a new regional replication sequence; wait for the next extract"
+            );
+        }
         progress::message(&format!(
-            "[{}] {pending} daily changes: {} → {}",
+            "[{}] {pending} replication changes: {} → {}",
             entry.id, anchor.sequence, latest.sequence
         ));
         for number in anchor.sequence + 1..=latest.sequence {
@@ -714,6 +847,13 @@ impl Operations<'_> {
             ));
         }
         Ok(current)
+    }
+
+    fn identity(&self, entry: &Region) -> Result<SourceIdentity> {
+        match self.source {
+            Some(source) => Ok(source.identity()),
+            None => SourceIdentity::from_replication_url(&entry.updates_url()),
+        }
     }
 }
 
@@ -829,6 +969,7 @@ pub fn resume_cleanup(entry: &Region, data: &Path, manifest: &str) -> Result<()>
         "Invalid cleanup record"
     );
     let record: Value = serde_json::from_slice(&fs::read(&marker)?)?;
+    let sources = cleanup_sources(entry, &record)?;
     ensure!(
         format::is_hash(manifest)
             && record["region"].as_str() == Some(&entry.id)
@@ -867,7 +1008,7 @@ pub fn resume_cleanup(entry: &Region, data: &Path, manifest: &str) -> Result<()>
         reject_symlinks(&[&url])?;
         if url.try_exists()? {
             ensure!(
-                fs::read_to_string(url)?.trim() == entry.source_url(),
+                sources.contains(&fs::read_to_string(&url)?.trim().to_owned()),
                 "Download source changed after publication"
             );
         }
@@ -890,6 +1031,40 @@ pub fn resume_cleanup(entry: &Region, data: &Path, manifest: &str) -> Result<()>
 }
 
 pub fn cleanup_region(entry: &Region, data: &Path, manifest: &str) -> Result<()> {
+    cleanup_region_sources(entry, data, manifest, &[entry.source_url()])
+}
+
+fn cleanup_sources(entry: &Region, record: &Value) -> Result<Vec<String>> {
+    let Some(sources) = record.get("sources") else {
+        return Ok(vec![entry.source_url()]);
+    };
+    let sources: Vec<String> = serde_json::from_value(sources.clone())?;
+    ensure!(
+        !sources.is_empty() && sources.len() <= 2,
+        "Invalid cleanup sources"
+    );
+    for source in &sources {
+        if source == &entry.source_url() {
+            continue;
+        }
+        let extract = source
+            .strip_prefix("https://download.openstreetmap.fr/extracts/")
+            .and_then(|value| value.strip_suffix(".osm.pbf"))
+            .context("Invalid cleanup source")?;
+        let identity = SourceIdentity::from_replication_url(&format!(
+            "https://download.openstreetmap.fr/replication/{extract}/minute"
+        ))?;
+        ensure!(identity.source_url()? == *source, "Invalid cleanup source");
+    }
+    Ok(sources)
+}
+
+fn cleanup_region_sources(
+    entry: &Region,
+    data: &Path,
+    manifest: &str,
+    sources: &[String],
+) -> Result<()> {
     ensure!(format::is_hash(manifest), "Invalid published manifest");
     let state = data.join(&entry.id);
     let downloads = data.join(".downloads");
@@ -921,7 +1096,7 @@ pub fn cleanup_region(entry: &Region, data: &Path, manifest: &str) -> Result<()>
             reject_symlinks(&[&path, &url])?;
             if path.is_dir()
                 && url.is_file()
-                && fs::read_to_string(&url)?.trim() == entry.source_url()
+                && sources.contains(&fs::read_to_string(&url)?.trim().to_owned())
             {
                 names.push(name.to_owned());
             }
@@ -930,7 +1105,9 @@ pub fn cleanup_region(entry: &Region, data: &Path, manifest: &str) -> Result<()>
     names.sort();
     atomic_write(
         &marker,
-        &serde_json::to_vec(&json!({"region":entry.id,"manifest":manifest,"downloads":names}))?,
+        &serde_json::to_vec(
+            &json!({"region":entry.id,"manifest":manifest,"downloads":names,"sources":sources}),
+        )?,
     )?;
     resume_cleanup(entry, data, manifest)
 }
@@ -1396,6 +1573,111 @@ struct CloudWork<'a> {
     publisher: Publisher,
     client: dispatch::Client,
     cleanup: bool,
+    fallbacks: Vec<FallbackSource>,
+}
+
+impl CloudWork<'_> {
+    fn sources(&self, task: &ClaimedRegion) -> Result<Vec<String>> {
+        let entry = Region {
+            id: task.lease.region.clone(),
+            extract: task.lease.extract.clone(),
+        };
+        let mut sources = vec![entry.source_url()];
+        if let Some(fallback) = source::fallback_for(&self.fallbacks, &entry) {
+            sources.push(fallback.identity().source_url()?);
+        }
+        Ok(sources)
+    }
+}
+
+fn retained_source(source: &SourceIdentity) -> &'static str {
+    match source.provider {
+        SourceProvider::Geofabrik => "pending-geofabrik",
+        SourceProvider::OsmFrance => "pending-osm-fr",
+    }
+}
+
+fn select_candidate(work: &Path, entry: &Region, source: &SourceIdentity) -> Result<()> {
+    let candidate = work.join(&entry.id);
+    reject_symlinks(&[work, &candidate])?;
+    if candidate.try_exists()? {
+        let identity = incremental::source_identity(&candidate)?;
+        if &identity == source {
+            return Ok(());
+        }
+        let retained = work.join(retained_source(&identity));
+        reject_symlinks(&[&retained])?;
+        ensure!(
+            !retained.try_exists()?,
+            "Conflicting unpublished source candidates"
+        );
+        fs::rename(&candidate, &retained)?;
+        sync_directory(work)?;
+    }
+    let retained = work.join(retained_source(source));
+    reject_symlinks(&[&retained])?;
+    if retained.try_exists()? {
+        ensure!(
+            incremental::source_identity(&retained)? == *source,
+            "Retained candidate source changed"
+        );
+        fs::rename(&retained, &candidate)?;
+        sync_directory(work)?;
+    }
+    Ok(())
+}
+
+fn finish_candidate(data: &Path, entry: &Region, manifest: &str, sources: &[String]) -> Result<()> {
+    validate_release(
+        &data.join(&entry.id).join("output/release.json"),
+        entry,
+        manifest,
+    )?;
+    let work = data.join(".candidates").join(&entry.id);
+    let downloads = work.join(".downloads");
+    reject_symlinks(&[&data.join(".candidates"), &work, &downloads])?;
+    ensure!(
+        !work.join(&entry.id).try_exists()?,
+        "Unpublished candidate must be retained"
+    );
+    for name in ["pending-geofabrik", "pending-osm-fr"] {
+        let state = work.join(name);
+        reject_symlinks(&[&state])?;
+        if state.try_exists()? {
+            let identity = incremental::source_identity(&state)?;
+            ensure!(
+                sources.contains(&identity.source_url()?),
+                "Retained candidate is not an approved regional source"
+            );
+            let release: Value =
+                serde_json::from_slice(&fs::read(state.join("output/release.json"))?)?;
+            ensure!(
+                release["region"].as_str() == Some(&entry.id),
+                "Retained candidate region changed"
+            );
+            fs::remove_dir_all(state)?;
+        }
+    }
+    if downloads.try_exists()? {
+        for directory in fs::read_dir(&downloads)? {
+            let directory = directory?;
+            let name = directory.file_name();
+            if !name
+                .to_str()
+                .is_some_and(|name| managed_download(name, entry))
+            {
+                continue;
+            }
+            let path = directory.path();
+            let url = path.join("source.url");
+            reject_symlinks(&[&path, &url])?;
+            if url.try_exists()? && sources.contains(&fs::read_to_string(&url)?.trim().to_owned()) {
+                fs::remove_dir_all(path)?;
+            }
+        }
+        sync_directory(&downloads)?;
+    }
+    sync_directory(&work)
 }
 
 impl WorkOperations for CloudWork<'_> {
@@ -1443,6 +1725,45 @@ impl WorkOperations for CloudWork<'_> {
         };
         progress::message(&format!("Claimed generation {}", task.lease.generation));
         let data = &self.runtime.data_dir;
+        let promotion = data
+            .join(".candidates")
+            .join(&entry.id)
+            .join("promotion.json");
+        let candidate = data.join(".candidates").join(&entry.id).join(&entry.id);
+        if promotion.try_exists()?
+            || is_symlink(&promotion)?
+            || candidate.parent().is_some_and(Path::is_dir)
+        {
+            let remote = self.publisher.read_state()?;
+            let manifest = remote
+                .as_ref()
+                .and_then(|state| {
+                    state
+                        .regions
+                        .iter()
+                        .find(|region| region.region == entry.id)
+                })
+                .map(|region| region.manifest.as_str());
+            crate::promotion::recover(data, &entry.id, manifest)?;
+            if let Some(manifest) = manifest
+                && candidate.try_exists()?
+                && validate_release(&candidate.join("output/release.json"), &entry, manifest)
+                    .is_ok()
+            {
+                crate::promotion::promote(data, &entry.id, manifest)?;
+            }
+            if let Some(manifest) = manifest
+                && !candidate.try_exists()?
+                && validate_release(
+                    &data.join(&entry.id).join("output/release.json"),
+                    &entry,
+                    manifest,
+                )
+                .is_ok()
+            {
+                finish_candidate(data, &entry, manifest, &self.sources(task)?)?;
+            }
+        }
         let marker = data.join(format!(".cleanup-{}.json", entry.id));
         if marker.try_exists()? || is_symlink(&marker)? {
             ensure!(
@@ -1464,18 +1785,8 @@ impl WorkOperations for CloudWork<'_> {
         let catalog = tempfile::Builder::new()
             .prefix("catalog-")
             .tempdir_in(&self.scratch)?;
-        let mut downloader = Downloader::new(self.runtime)?;
-        let control = flow.control(slot);
-        control.consume();
-        downloader.control = Some(control);
-        downloader.download(
-            self.runtime,
-            INDEX_URL,
-            &catalog.path().join("index.json"),
-            Some(64 * 1024 * 1024),
-        )?;
         flow.check()?;
-        if !data.join(&entry.id).try_exists()? {
+        if !data.join(&entry.id).try_exists()? && !candidate.try_exists()? {
             let control = flow.control(slot);
             task.prefetch = Some(Prefetch::controlled(
                 self.runtime,
@@ -1483,9 +1794,10 @@ impl WorkOperations for CloudWork<'_> {
                 &catalog.path().join("index.json"),
                 data,
                 Arc::clone(&control),
+                source::fallback_for(&self.fallbacks, &entry).is_some(),
             ));
             task.download_control = Some(control);
-        } else {
+        } else if source::fallback_for(&self.fallbacks, &entry).is_none() {
             flow.sources_ready.lock().expect("source readiness lock")[slot] = true;
         }
         task.catalog = Some(catalog);
@@ -1539,14 +1851,74 @@ impl WorkOperations for CloudWork<'_> {
             publisher: None,
             lease: Some(guard),
             prefetch: task.prefetch.take(),
+            source: None,
         };
         guard.lease()?;
-        if !self.runtime.data_dir.join(&entry.id).try_exists()? {
-            operations.initialize(&entry, &self.runtime.data_dir, None, None)?;
+        let data = &self.runtime.data_dir;
+        let fallback = source::fallback_for(&self.fallbacks, &entry);
+        let active = data.join(&entry.id);
+        let candidates = data.join(".candidates").join(&entry.id);
+        reject_symlinks(&[data, &data.join(".candidates"), &candidates, &active])?;
+        if active.try_exists()? {
+            let identity = incremental::source_identity(&active)?;
+            if identity.provider == SourceProvider::OsmFrance {
+                let source = fallback.context("Active source has no approved fallback mapping")?;
+                ensure!(
+                    identity == source.identity(),
+                    "Active source no longer matches its approved mapping"
+                );
+                operations.source = Some(source);
+            }
         }
-        flow.check()?;
-        guard.lease()?;
-        operations.update(&entry, &self.runtime.data_dir)
+        let initial_data = if active.try_exists()? || !candidates.join(&entry.id).try_exists()? {
+            data
+        } else {
+            &candidates
+        };
+        let result = (|| {
+            if !initial_data.join(&entry.id).try_exists()? {
+                operations.initialize(&entry, initial_data, None, None)?;
+            } else if initial_data == &candidates {
+                let identity = incremental::source_identity(&candidates.join(&entry.id))?;
+                operations.source = match identity.provider {
+                    SourceProvider::Geofabrik => None,
+                    SourceProvider::OsmFrance => {
+                        Some(fallback.context("Candidate source has no approved mapping")?)
+                    }
+                };
+            }
+            flow.check()?;
+            guard.lease()?;
+            operations.update(&entry, initial_data)
+        })();
+        let result = match result {
+            Err(error) if crate::network::retryable(&error) && fallback.is_some() => {
+                flow.check()?;
+                guard.lease()?;
+                operations.downloader.check_cancelled()?;
+                operations.prefetch = None;
+                operations.source = if operations.source.is_some() {
+                    None
+                } else {
+                    fallback
+                };
+                fs::create_dir_all(&candidates)?;
+                let candidate = candidates.join(&entry.id);
+                select_candidate(&candidates, &entry, &operations.identity(&entry)?)?;
+                if !candidate.try_exists()? {
+                    progress::message(
+                        "Source retries exhausted; building an isolated alternate candidate",
+                    );
+                    operations.initialize(&entry, &candidates, None, None)?;
+                }
+                operations.update(&entry, &candidates)
+            }
+            other => other,
+        }?;
+        // ponytail: approved failover regions defer peer prefetch until compute finishes; add preemption only if throughput requires it.
+        flow.sources_ready.lock().expect("source readiness lock")[slot] = true;
+        flow.changed.notify_all();
+        Ok(result)
     }
 
     fn publish(&self, task: &Self::Task, output: &Value, cancelled: &AtomicBool) -> Result<()> {
@@ -1562,17 +1934,40 @@ impl WorkOperations for CloudWork<'_> {
             cancelled,
             |event| reporter.update(event),
         )?;
+        let candidate = self
+            .runtime
+            .data_dir
+            .join(".candidates")
+            .join(&task.lease.region)
+            .join(&task.lease.region);
+        if Path::new(string(output, "output")?).starts_with(&candidate) {
+            crate::promotion::promote(
+                &self.runtime.data_dir,
+                &task.lease.region,
+                string(output, "manifest")?,
+            )?;
+            finish_candidate(
+                &self.runtime.data_dir,
+                &Region {
+                    id: task.lease.region.clone(),
+                    extract: task.lease.extract.clone(),
+                },
+                string(output, "manifest")?,
+                &self.sources(task)?,
+            )?;
+        }
         Ok(())
     }
 
     fn cleanup(&self, task: &Self::Task, output: &Value) -> Result<()> {
-        cleanup_region(
+        cleanup_region_sources(
             &Region {
                 id: task.lease.region.clone(),
                 extract: task.lease.extract.clone(),
             },
             &self.runtime.data_dir,
             string(output, "manifest")?,
+            &self.sources(task)?,
         )
     }
 
@@ -1616,6 +2011,10 @@ pub fn work(
             publisher,
             client,
             cleanup,
+            fallbacks: source::fallback_sources(
+                &root.join("config/fallback-sources.json"),
+                &source::regions(&root.join("config/regions.json"))?,
+            )?,
         },
         once,
         cleanup,
@@ -1780,6 +2179,7 @@ pub fn run(
         publisher: None,
         lease: None,
         prefetch: None,
+        source: None,
     };
     if cleanup {
         operations.publisher()?;
@@ -2273,6 +2673,7 @@ mod tests {
     #[test]
     fn prefetch_failure_stops_other_slots_before_the_source_is_consumed() {
         let work = work();
+        fs::write(work.path().join("missing-catalog.json"), b"{}").unwrap();
         let flow = Arc::new(PipelineFlow::new(true));
         let failed = flow.control(0);
         let other = flow.control(1);
@@ -2283,6 +2684,7 @@ mod tests {
             &work.path().join("missing-catalog.json"),
             work.path(),
             Arc::clone(&failed),
+            false,
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !flow.cancelled.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
@@ -2350,6 +2752,7 @@ mod tests {
             publisher: None,
             lease: None,
             prefetch: None,
+            source: None,
         };
         disk_check(work.path(), 0).unwrap();
         let region = entry("france");
@@ -3013,6 +3416,7 @@ mod tests {
             publisher: None,
             lease: None,
             prefetch: Some(prefetch),
+            source: None,
         };
         operations.start_prefetch(Some(&entry("italy")), work.path());
         assert_eq!(operations.prefetch.as_ref().unwrap().region, "germany");
@@ -3075,6 +3479,7 @@ mod tests {
                 task: Some(std::thread::spawn(move || Ok(owned))),
                 error: None,
             }),
+            source: None,
         };
         let error = operations
             .initialize(&entry("germany"), work.path(), None, None)
@@ -3233,5 +3638,219 @@ mod tests {
         release.send(()).unwrap();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(elapsed < Duration::from_millis(500));
+    }
+
+    fn candidate_index(state: &Path, entry: &Region, identity: &SourceIdentity) -> Value {
+        fs::create_dir_all(state.parent().unwrap()).unwrap();
+        let fixture = tempfile::Builder::new()
+            .prefix("source-fixture-")
+            .tempdir_in(state.parent().unwrap())
+            .unwrap();
+        let input = crate::test_common::write_pbf(
+            fixture.path(),
+            "input",
+            r#"<osm version="0.6"><node id="1" lat="0" lon="0"><tag k="name" v="Cafe"/><tag k="amenity" v="cafe"/></node></osm>"#,
+            &[],
+        );
+        let coverage = fixture.path().join("coverage.json");
+        fs::write(
+            &coverage,
+            r#"{"type":"Polygon","coordinates":[[[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]]]}"#,
+        )
+        .unwrap();
+        incremental::initialize(
+            &incremental::InitOptions {
+                source_sha256: format::hash_bytes(&fs::read(&input).unwrap()),
+                input,
+                state: state.to_owned(),
+                coverage,
+                region: entry.id.clone(),
+                source_timestamp: "2020-01-01T00:00:00Z".into(),
+                source_sequence: 10,
+                replication_url: identity.replication_url.clone(),
+            },
+            &runtime().compute_options(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn candidate_source_rotation_preserves_both_indexes_and_the_active_database() {
+        let data = work();
+        let entry = entry("france");
+        let primary = SourceIdentity::from_replication_url(&entry.updates_url()).unwrap();
+        let alternate = SourceIdentity::from_replication_url(
+            "https://download.openstreetmap.fr/replication/europe/france/minute",
+        )
+        .unwrap();
+        let active = data.path().join(&entry.id);
+        candidate_index(&active, &entry, &primary);
+        let active_bytes = fs::read(active.join("state.sqlite")).unwrap();
+        let work = data.path().join(".candidates").join(&entry.id);
+        let selected = work.join(&entry.id);
+        candidate_index(&selected, &entry, &primary);
+        let primary_bytes = fs::read(selected.join("state.sqlite")).unwrap();
+        select_candidate(&work, &entry, &alternate).unwrap();
+        assert!(!selected.exists());
+        assert_eq!(
+            fs::read(work.join("pending-geofabrik/state.sqlite")).unwrap(),
+            primary_bytes
+        );
+        candidate_index(&selected, &entry, &alternate);
+        let alternate_bytes = fs::read(selected.join("state.sqlite")).unwrap();
+        select_candidate(&work, &entry, &primary).unwrap();
+        assert_eq!(incremental::source_identity(&selected).unwrap(), primary);
+        assert_eq!(
+            fs::read(selected.join("state.sqlite")).unwrap(),
+            primary_bytes
+        );
+        assert_eq!(
+            fs::read(work.join("pending-osm-fr/state.sqlite")).unwrap(),
+            alternate_bytes
+        );
+        select_candidate(&work, &entry, &alternate).unwrap();
+        assert_eq!(incremental::source_identity(&selected).unwrap(), alternate);
+        assert_eq!(
+            fs::read(selected.join("state.sqlite")).unwrap(),
+            alternate_bytes
+        );
+        assert_eq!(
+            fs::read(work.join("pending-geofabrik/state.sqlite")).unwrap(),
+            primary_bytes
+        );
+        assert_eq!(fs::read(active.join("state.sqlite")).unwrap(), active_bytes);
+    }
+
+    #[test]
+    fn candidate_finish_requires_confirmation_and_preserves_unapproved_downloads() {
+        let data = work();
+        let entry = entry("france");
+        release(data.path(), &entry, &manifest());
+        let primary = SourceIdentity::from_replication_url(&entry.updates_url()).unwrap();
+        let alternate = SourceIdentity::from_replication_url(
+            "https://download.openstreetmap.fr/replication/europe/france/minute",
+        )
+        .unwrap();
+        let sources = [
+            primary.source_url().unwrap(),
+            alternate.source_url().unwrap(),
+        ];
+        let work = data.path().join(".candidates").join(&entry.id);
+        let retained = work.join("pending-geofabrik");
+        candidate_index(&retained, &entry, &primary);
+        let primary_job = download_job(&work, &entry, "primary");
+        let alternate_job = download_job(&work, &entry, "alternate");
+        fs::write(alternate_job.join("source.url"), &sources[1]).unwrap();
+        let other_source = download_job(&work, &entry, "unapproved");
+        fs::write(
+            other_source.join("source.url"),
+            "https://download.openstreetmap.fr/extracts/europe/germany.osm.pbf",
+        )
+        .unwrap();
+        let other_region = download_job(&work, &super::tests::entry("germany"), "owned");
+        let unmanaged = work.join(".downloads/manual");
+        fs::create_dir(&unmanaged).unwrap();
+        fs::write(unmanaged.join("source.url"), &sources[1]).unwrap();
+        assert!(finish_candidate(data.path(), &entry, &"b".repeat(64), &sources).is_err());
+        for path in [
+            &retained,
+            &primary_job,
+            &alternate_job,
+            &other_source,
+            &other_region,
+            &unmanaged,
+        ] {
+            assert!(path.exists(), "{}", path.display());
+        }
+        finish_candidate(data.path(), &entry, &manifest(), &sources).unwrap();
+        for path in [&retained, &primary_job, &alternate_job] {
+            assert!(!path.exists(), "{}", path.display());
+        }
+        for path in [&other_source, &other_region, &unmanaged] {
+            assert!(path.exists(), "{}", path.display());
+        }
+        assert!(
+            data.path()
+                .join(&entry.id)
+                .join("output/release.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn source_aware_cleanup_removes_only_approved_osm_france_downloads() {
+        let data = work();
+        let entry = entry("france");
+        release(data.path(), &entry, &manifest());
+        let source = "https://download.openstreetmap.fr/extracts/europe/france.osm.pbf".to_owned();
+        let alternate = download_job(data.path(), &entry, "alternate");
+        fs::write(alternate.join("source.url"), &source).unwrap();
+        let primary = download_job(data.path(), &entry, "primary");
+        cleanup_region_sources(&entry, data.path(), &manifest(), &[source]).unwrap();
+        assert!(!data.path().join(&entry.id).exists());
+        assert!(!alternate.exists());
+        assert!(primary.exists());
+        assert!(!data.path().join(".cleanup-france.json").exists());
+    }
+
+    #[test]
+    fn interrupted_osm_france_cleanup_resumes_after_the_index_has_been_removed() {
+        let data = work();
+        let entry = entry("france");
+        let source = "https://download.openstreetmap.fr/extracts/europe/france.osm.pbf";
+        let alternate = download_job(data.path(), &entry, "alternate");
+        fs::write(alternate.join("source.url"), source).unwrap();
+        let other = download_job(data.path(), &entry, "primary");
+        let marker = data.path().join(".cleanup-france.json");
+        fs::write(
+            &marker,
+            serde_json::to_vec(&json!({
+                "region":entry.id,
+                "manifest":manifest(),
+                "downloads":["france-alternate","france-alreadygone"],
+                "sources":[source],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(resume_cleanup(&entry, data.path(), &"b".repeat(64)).is_err());
+        assert!(alternate.exists());
+        assert!(marker.exists());
+        resume_cleanup(&entry, data.path(), &manifest()).unwrap();
+        assert!(!alternate.exists());
+        assert!(!marker.exists());
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates_but_rejects_invalid_or_past_values() {
+        assert_eq!(retry_after("120"), Some(Duration::from_secs(120)));
+        assert_eq!(retry_after("0"), Some(Duration::ZERO));
+        assert!(retry_after("01 Jan 9999 00:00:00 GMT").is_some());
+        for value in ["invalid", "-1", "1.5", "Thu, 01 Jan 1970 00:00:00 GMT"] {
+            assert!(retry_after(value).is_none(), "{value}");
+        }
+    }
+
+    #[test]
+    fn fallback_prefetch_failure_keeps_the_pipeline_and_peer_download_paused() {
+        let work = work();
+        let catalog = work.path().join("catalog.json");
+        fs::write(&catalog, b"{}").unwrap();
+        let flow = Arc::new(PipelineFlow::new(true));
+        let control = flow.control(0);
+        control.consume();
+        let prefetch = Prefetch::controlled(
+            &runtime(),
+            &entry("france"),
+            &catalog,
+            work.path(),
+            Arc::clone(&control),
+            true,
+        );
+        assert!(prefetch.consume().is_err());
+        assert!(flow.check().is_ok());
+        assert!(!flow.sources_ready.lock().unwrap()[0]);
+        assert!(!control.failed.load(Ordering::Acquire));
     }
 }

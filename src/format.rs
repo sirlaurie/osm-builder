@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::source::SourceIdentity;
+
 pub const MAX_ID: u64 = 9_007_199_254_740_991;
 pub const MAX_BLOCK: usize = 262_144;
 pub const MAX_PACK: usize = 1_048_576;
@@ -70,6 +72,8 @@ pub struct Manifest {
     pub region: String,
     pub source_timestamp: String,
     pub source_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceIdentity>,
     #[serde(rename = "sourceSHA256")]
     pub source_sha256: String,
     pub coverage: Value,
@@ -338,7 +342,14 @@ pub fn validate_manifest(value: &Value) -> Result<Manifest> {
         value.get("sourceSequence").is_some(),
         "Manifest has no sourceSequence"
     );
+    ensure!(
+        !value.get("source").is_some_and(Value::is_null),
+        "Manifest source must be an identity object"
+    );
     let manifest: Manifest = serde_json::from_value(value.clone()).context("Invalid manifest")?;
+    if let Some(source) = &manifest.source {
+        source.validate()?;
+    }
     ensure!(
         matches!(manifest.schema, 1 | 2)
             && is_region(&manifest.region)
