@@ -6,7 +6,7 @@
 
 ## 部署
 
-需要 macOS 或 Linux、Rust 1.95+ 和 C/C++ 编译工具；macOS 使用 Xcode Command Line Tools。默认要求数据盘和项目所在盘各有 60 GiB 可用空间；处理全部地区需要更多容量。
+需要 macOS 或 Linux、Rust 1.95+ 和 C/C++ 编译工具；macOS 使用 Xcode Command Line Tools。默认启动新地区要求数据盘和项目所在盘各有 10 GiB 可用空间，后续检查保留 5 GiB；下载预算还计入待下载字节。PBF 是压缩数据，SQLite 索引、临时文件和打包产物会占用额外空间，这些门槛不代表每个地区的容量上限。可用 `OSM_START_FREE_GIB`、`OSM_MIN_FREE_GIB` 覆盖默认值；已有环境变量或 `.env` 中的设置优先于仓库默认配置。
 
 在 `osm-builder` 目录编译：
 

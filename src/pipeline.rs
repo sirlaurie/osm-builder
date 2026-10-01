@@ -2396,17 +2396,20 @@ mod tests {
             });
             let downloader = Downloader::new(&runtime()).unwrap();
             let path = work.path().join("source.part");
-            assert!(
-                downloader
-                    .executor()
-                    .block_on(downloader.download_attempt(
-                        &runtime(),
-                        &url,
-                        &path,
-                        Duration::from_secs(2),
-                        limit
-                    ))
-                    .is_err()
+            let error = downloader
+                .executor()
+                .block_on(downloader.download_attempt(
+                    &runtime(),
+                    &url,
+                    &path,
+                    Duration::from_secs(2),
+                    limit,
+                ))
+                .unwrap_err();
+            assert_eq!(
+                crate::network::retryable(&error),
+                limit.is_none(),
+                "{error:#}"
             );
             if let Some(limit) = limit {
                 assert!(fs::metadata(path).unwrap().len() <= limit);

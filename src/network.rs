@@ -16,8 +16,10 @@ pub fn request(error: reqwest::Error) -> anyhow::Error {
         "Network timeout (DNS, TCP, TLS or response)"
     } else if error.is_connect() {
         "Network connection failed (DNS, TCP or TLS)"
-    } else if error.is_builder() || error.is_redirect() || error.is_decode() {
+    } else if error.is_builder() || error.is_redirect() {
         return anyhow::anyhow!("Invalid HTTP request or response");
+    } else if error.is_decode() {
+        "Network response body decoding failed"
     } else if let Some(status) = error.status() {
         let message = format!("HTTP request failed: {status}");
         return if status.is_server_error() || status.as_u16() == 429 {
