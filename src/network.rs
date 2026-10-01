@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{error::Error, fmt};
 
 #[derive(Clone, Debug)]
 pub struct Transient(pub String);
@@ -12,6 +12,13 @@ impl fmt::Display for Transient {
 impl std::error::Error for Transient {}
 
 pub fn request(error: reqwest::Error) -> anyhow::Error {
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(transient) = cause.downcast_ref::<Transient>() {
+            return transient.clone().into();
+        }
+        source = cause.source();
+    }
     let reason = if error.is_timeout() {
         "Network timeout (DNS, TCP, TLS or response)"
     } else if error.is_connect() {

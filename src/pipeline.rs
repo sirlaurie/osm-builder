@@ -103,7 +103,9 @@ impl Downloader {
                 if attempt.url().scheme() != "https" {
                     attempt.error("Downloads require HTTPS redirects")
                 } else if attempt.previous().len() >= 10 {
-                    attempt.error("Too many download redirects")
+                    attempt.error(crate::network::Transient(
+                        "Too many download redirects".into(),
+                    ))
                 } else {
                     attempt.follow()
                 }

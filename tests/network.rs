@@ -5,23 +5,25 @@ use std::net::TcpListener;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-fn response(bytes: &'static [u8]) -> (String, JoinHandle<()>) {
+fn response(bytes: &'static [u8], requests: usize) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let worker = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut reader = BufReader::new(&stream);
-        loop {
-            let mut line = String::new();
-            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-            if line == "\r\n" {
-                break;
+        for _ in 0..requests {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&stream);
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
             }
+            stream.write_all(bytes).unwrap();
         }
-        stream.write_all(bytes).unwrap();
     });
     (url, worker)
 }
@@ -37,7 +39,7 @@ async fn broken_response_framing_is_retryable() {
         &b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\ndata"[..],
         &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\ndata\r\ninvalid\r\n"[..],
     ] {
-        let (url, worker) = response(bytes);
+        let (url, worker) = response(bytes, 1);
         let mut response = client.get(url).send().await.unwrap();
         let error = loop {
             match response.chunk().await {
@@ -62,7 +64,7 @@ async fn invalid_request_is_not_retryable() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn rejected_redirect_is_not_retryable() {
-    let (url, worker) = response(b"HTTP/1.1 302 Found\r\nLocation: http://unsafe.example/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let (url, worker) = response(b"HTTP/1.1 302 Found\r\nLocation: http://unsafe.example/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 1);
     let error = Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
@@ -76,4 +78,30 @@ async fn rejected_redirect_is_not_retryable() {
     worker.join().unwrap();
     assert!(error.is_redirect());
     assert!(!network::retryable(&network::request(error)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn redirect_loop_marked_transient_is_retryable() {
+    let (url, worker) = response(b"HTTP/1.1 301 Moved Permanently\r\nLocation: /\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 3);
+    let error = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .redirect(Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                attempt.error(network::Transient("Download redirect limit reached".into()))
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .unwrap()
+        .get(url)
+        .send()
+        .await
+        .unwrap_err();
+    worker.join().unwrap();
+    assert!(error.is_redirect());
+    let error = network::request(error);
+    assert!(network::retryable(&error), "{error:#}");
+    assert_eq!(error.to_string(), "Download redirect limit reached");
 }
