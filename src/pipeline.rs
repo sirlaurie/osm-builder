@@ -375,7 +375,10 @@ impl Downloader {
         let state = source::replication_state(&fs::read_to_string(path)?)?;
         ensure!(
             sequence.is_none_or(|sequence| sequence == state.sequence),
-            "Replication state sequence does not match its download path"
+            crate::network::Transient(format!(
+                "Replication state is not ready: requested sequence {sequence:?}, received {}",
+                state.sequence
+            ))
         );
         Ok(state)
     }
@@ -477,6 +480,18 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
 
 fn sequence(value: &Value) -> Result<u64> {
     value["sequence"].as_u64().context("Missing index sequence")
+}
+
+fn replication_progress(earlier: &ReplicationState, later: &ReplicationState) -> Result<()> {
+    ensure!(
+        (later.sequence > earlier.sequence && later.timestamp >= earlier.timestamp)
+            || later == earlier,
+        crate::network::Transient(format!(
+            "Regional replication is not ready: sequence {} at {} conflicts with sequence {} at {}; retaining the local index",
+            later.sequence, later.timestamp, earlier.sequence, earlier.timestamp
+        ))
+    );
+    Ok(())
 }
 
 fn status(entry: &Region, data: &Path, runtime: &Runtime) -> Result<Value> {
@@ -707,10 +722,13 @@ impl Operations<'_> {
             work.path(),
             Some(metadata.sequence),
         )?;
-        ensure!(
-            anchor.timestamp == metadata.timestamp,
-            "PBF timestamp does not match its regional replication sequence"
-        );
+        replication_progress(
+            &ReplicationState {
+                sequence: metadata.sequence,
+                timestamp: metadata.timestamp.clone(),
+            },
+            &anchor,
+        )?;
         let candidate = work.path().join("index");
         self.check_disks(data, self.runtime.min_free_gib)?;
         self.downloader.check_cancelled()?;
@@ -762,17 +780,17 @@ impl Operations<'_> {
             work.path(),
             Some(sequence(&current)?),
         )?;
-        ensure!(
-            anchor.timestamp == string(&current, "timestamp")?,
-            "Regional replication history changed; the local anchor no longer matches"
-        );
+        replication_progress(
+            &ReplicationState {
+                sequence: sequence(&current)?,
+                timestamp: string(&current, "timestamp")?.to_owned(),
+            },
+            &anchor,
+        )?;
         let latest = self
             .downloader
             .remote_state(self.runtime, &url, work.path(), None)?;
-        ensure!(
-            latest.sequence >= anchor.sequence && latest.timestamp >= anchor.timestamp,
-            "Regional replication sequence or timestamp regressed"
-        );
+        replication_progress(&anchor, &latest)?;
         let pending = latest.sequence - anchor.sequence;
         if let Some(source) = self.source {
             source::prepare_fallback(source, work.path())?;
@@ -799,7 +817,7 @@ impl Operations<'_> {
         } else {
             ensure!(
                 pending != 0 || string(&current, "coverageSHA256")? == coverage_hash,
-                "Catalog coverage changed without a new regional replication sequence; wait for the next extract"
+                crate::network::Transient("Catalog coverage changed without a new regional replication sequence; waiting for the next extract".into())
             );
         }
         progress::message(&format!(
@@ -815,15 +833,14 @@ impl Operations<'_> {
             let next =
                 self.downloader
                     .remote_state(self.runtime, &url, work.path(), Some(number))?;
-            ensure!(
-                next.timestamp.as_str() >= string(&current, "timestamp")?
-                    && next.timestamp <= latest.timestamp,
-                "Replication timestamps are not a continuous forward sequence"
-            );
-            ensure!(
-                number != latest.sequence || next == latest,
-                "Latest replication state changed within the selected sequence"
-            );
+            replication_progress(
+                &ReplicationState {
+                    sequence: sequence(&current)?,
+                    timestamp: string(&current, "timestamp")?.to_owned(),
+                },
+                &next,
+            )?;
+            replication_progress(&next, &latest)?;
             let change = work.path().join("change.osc.gz");
             self.downloader.download(
                 self.runtime,
@@ -2485,6 +2502,18 @@ mod tests {
             Ok(())
         }
         fn compute(&self, _: &mut (), flow: &Arc<PipelineFlow>, _: usize) -> Result<()> {
+            if self.stage == "replication-head" {
+                let attempt = self.failures.fetch_add(1, Ordering::SeqCst);
+                let anchor = source::replication_state(
+                    "sequenceNumber=3990\ntimestamp=2026-10-01T00:00:00Z\n",
+                )?;
+                let head = source::replication_state(if attempt < 16 {
+                    "sequenceNumber=3989\ntimestamp=2026-09-30T00:00:00Z\n"
+                } else {
+                    "sequenceNumber=3990\ntimestamp=2026-10-01T00:00:00Z\n"
+                })?;
+                return replication_progress(&anchor, &head);
+            }
             if self.stage == "prefetch" && self.failures.fetch_add(1, Ordering::SeqCst) == 0 {
                 flow.record_failure(
                     crate::network::Transient("Prefetch connection timeout".into()).into(),
@@ -2551,6 +2580,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn work_keeps_retrying_a_stale_replication_head_until_the_source_catches_up() {
+        let operations = RecoveringWork {
+            stage: "replication-head",
+            fatal: false,
+            failures: AtomicUsize::new(0),
+            occupied: AtomicBool::new(false),
+            acknowledged: AtomicBool::new(false),
+            cleaned: AtomicUsize::new(0),
+            releases: Mutex::new(Vec::new()),
+        };
+        let result = wait_for_work(&operations, true, true, Duration::ZERO);
+        assert!(
+            result.is_ok(),
+            "work exited instead of waiting for the source: {result:?}"
+        );
+        assert_eq!(operations.failures.load(Ordering::SeqCst), 17);
+        assert_eq!(*operations.releases.lock().unwrap(), vec!["retry"; 16]);
+        assert_eq!(operations.cleaned.load(Ordering::SeqCst), 1);
+        assert!(operations.acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn inconsistent_replication_states_remain_retryable_without_relaxing_the_sequence_checks() {
+        let anchor = ReplicationState {
+            sequence: 3990,
+            timestamp: "2026-10-01T00:00:00Z".into(),
+        };
+        for (sequence, timestamp) in [
+            (3989, "2026-10-01T00:00:00Z"),
+            (3991, "2026-09-30T00:00:00Z"),
+            (3990, "2026-10-02T00:00:00Z"),
+        ] {
+            let state = ReplicationState {
+                sequence,
+                timestamp: timestamp.into(),
+            };
+            let error = replication_progress(&anchor, &state).unwrap_err();
+            assert!(crate::network::retryable(&error), "{error}");
+            assert!(error.to_string().contains("3990"));
+        }
+        replication_progress(&anchor, &anchor).unwrap();
+        replication_progress(
+            &anchor,
+            &ReplicationState {
+                sequence: 3991,
+                timestamp: "2026-10-02T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
     }
 
     #[test]
