@@ -22,6 +22,15 @@ use crate::{
 const MAX_RESPONSE: usize = 1024 * 1024;
 const LEASE_TTL: Duration = Duration::from_secs(300);
 
+#[derive(Debug)]
+struct LeaseLost;
+
+impl std::fmt::Display for LeaseLost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Dispatch request rejected: lease_lost")
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Lease {
@@ -177,7 +186,7 @@ impl Client {
             match request.send() {
                 Ok(response) => {
                     let status = response.status();
-                    if status.as_u16() >= 500 || status.as_u16() == 429 {
+                    if network::retryable_status(status) {
                         if attempt + 1 == self.attempts {
                             return Err(network::Transient(format!(
                                 "Dispatch request failed: HTTP {}",
@@ -208,16 +217,22 @@ impl Client {
                                     return Ok(value);
                                 }
                                 let code = value.get("error").and_then(Value::as_str);
+                                if code == Some("lease_lost") {
+                                    return Err(anyhow::Error::new(network::Transient(
+                                        "Dispatch lease must be reacquired".into(),
+                                    ))
+                                    .context(LeaseLost));
+                                }
                                 if let Some(
-                                    code @ ("batch_active" | "lease_lost" | "invalid_start"
-                                    | "invalid_claim" | "invalid_lease"),
+                                    code @ ("batch_active" | "invalid_start" | "invalid_claim"
+                                    | "invalid_lease"),
                                 ) = code
                                 {
                                     bail!("Dispatch request rejected: {code}");
                                 }
                                 bail!("Dispatch request rejected: HTTP {}", status.as_u16());
                             }
-                            Err(_) if !status.is_success() => {
+                            Err(_) if matches!(status.as_u16(), 401 | 403) => {
                                 bail!("Dispatch request rejected: HTTP {}", status.as_u16());
                             }
                             Err(error) if attempt + 1 == self.attempts => {
@@ -241,11 +256,7 @@ impl Client {
                     }
                 }
             }
-            thread::sleep(
-                self.retry_delay
-                    .saturating_mul(1 << attempt)
-                    .min(remaining(deadline)?),
-            );
+            thread::sleep(network::backoff(self.retry_delay, attempt).min(remaining(deadline)?));
         }
         bail!("Dispatch request has no attempts")
     }
@@ -264,13 +275,12 @@ impl Client {
                 }),
             "Invalid dispatch batch"
         );
-        let value = self.request(
-            Method::POST,
-            "/admin/jobs/start",
-            Some(&json!({
-                "requestId": uuid()?, "mode": mode, "regions": regions,
-            })),
-        )?;
+        let body = json!({
+            "requestId": uuid()?, "mode": mode, "regions": regions,
+        });
+        let value = network::retry(self.retry_delay, || {
+            self.request(Method::POST, "/admin/jobs/start", Some(&body))
+        })?;
         value["batchId"]
             .as_str()
             .filter(|value| valid_uuid(value))
@@ -486,6 +496,12 @@ impl Guard {
                             state.network_error = None;
                         }
                         Ok(_) => break,
+                        Err(error) if error.downcast_ref::<LeaseLost>().is_some() => {
+                            state.deadline = Instant::now();
+                            state.network_error =
+                                error.downcast_ref::<network::Transient>().cloned();
+                            break;
+                        }
                         Err(error) if network::retryable(&error) => {
                             state.network_error =
                                 error.downcast_ref::<network::Transient>().cloned();

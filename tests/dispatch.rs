@@ -40,6 +40,7 @@ struct Reply {
     status: u16,
     body: Vec<u8>,
     disconnect: bool,
+    truncate: bool,
 }
 
 impl Reply {
@@ -48,6 +49,7 @@ impl Reply {
             status: 200,
             body: serde_json::to_vec(&value).unwrap(),
             disconnect: false,
+            truncate: false,
         }
     }
 }
@@ -113,7 +115,7 @@ impl Server {
                     stream,
                     "HTTP/1.1 {} Test\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
                     reply.status,
-                    reply.body.len()
+                    reply.body.len() + usize::from(reply.truncate)
                 );
                 let _ = stream.write_all(&reply.body);
             }
@@ -384,6 +386,7 @@ fn errors_and_oversized_responses_are_bounded_and_sanitized() {
             status,
             body: body.clone(),
             disconnect: false,
+            truncate: false,
         });
         let error = server.client(2).jobs().err().unwrap();
         let message = format!("{error:#}");
@@ -417,12 +420,19 @@ fn device_identity_is_persistent_concurrent_and_never_replaces_invalid_data() {
 
 #[test]
 fn guard_rejects_lost_lease_and_drop_wakes_a_pending_renewal() {
-    let server = Server::new(|path, _| {
-        assert_eq!(path, "/admin/jobs/renew");
-        Reply {
+    let server = Server::new(|path, _| match path {
+        "/admin/jobs/renew" => Reply {
             status: 409,
             ..Reply::json(json!({ "success": false, "error": "lease_lost" }))
+        },
+        "/admin/jobs/claim" => {
+            let mut replacement = lease();
+            replacement.generation = 2;
+            replacement.token = BATCH.into();
+            Reply::json(json!({"batchId":BATCH,"lease":replacement,"pending":0,
+                "running":1,"failed":0,"retryAfterSeconds":60}))
         }
+        _ => panic!("Unexpected dispatch path"),
     });
     let mut short = lease();
     short.expires_at = "2000-01-01T00:00:00Z".into();
@@ -433,20 +443,33 @@ fn guard_rejects_lost_lease_and_drop_wakes_a_pending_renewal() {
     while guard.lease().is_ok() && Instant::now() < until {
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(guard.lease().is_err());
+    assert!(network::retryable(&guard.lease().err().unwrap()));
     assert_eq!(server.requests.lock().unwrap().len(), 1);
+    let mut retry_existing = true;
+    let replacement = network::retry(Duration::ZERO, || {
+        if std::mem::take(&mut retry_existing) {
+            return guard.lease();
+        }
+        Ok(server.client(1).claim(DEVICE, &[], 0)?.lease.unwrap())
+    })
+    .unwrap();
+    assert_eq!(replacement.generation, 2);
+    assert_ne!(replacement.token, TOKEN);
+    assert!(guard.lease().is_err());
     drop(guard);
     let guard = Guard::start(server.client(1), lease()).unwrap();
     let started = Instant::now();
     drop(guard);
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
 }
 
 #[test]
 fn transport_and_service_outages_are_retryable_but_rejections_are_not() {
     for (status, disconnect, retryable) in [
         (200, true, true),
+        (408, false, true),
+        (425, false, true),
         (429, false, true),
         (503, false, true),
         (401, false, false),
@@ -457,6 +480,7 @@ fn transport_and_service_outages_are_retryable_but_rejections_are_not() {
             status,
             body: b"invalid JSON".to_vec(),
             disconnect,
+            truncate: false,
         });
         let error = server.client(2).jobs().unwrap_err();
         assert_eq!(network::retryable(&error), retryable, "{error:#}");
@@ -465,6 +489,56 @@ fn transport_and_service_outages_are_retryable_but_rejections_are_not() {
             if retryable { 2 } else { 1 }
         );
         assert!(!format!("{error:#}").contains(AUTHORIZATION));
+    }
+}
+
+#[test]
+fn batch_submission_reuses_request_identity_after_exhausting_inner_attempts() {
+    let calls = Mutex::new(0);
+    let server = Server::new(move |path, _| {
+        assert_eq!(path, "/admin/jobs/start");
+        let mut calls = calls.lock().unwrap();
+        *calls += 1;
+        Reply {
+            disconnect: *calls <= 5,
+            ..Reply::json(json!({ "batchId": BATCH }))
+        }
+    });
+    let batch = server
+        .client(2)
+        .start(
+            "update",
+            &[Region {
+                id: "test-region".into(),
+                extract: "europe/germany/berlin".into(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(batch, BATCH);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(requests.iter().all(|request| request == &requests[0]));
+}
+
+#[test]
+fn batch_submission_does_not_retry_authentication_or_active_batch_rejections() {
+    for (status, code) in [(401, "unauthorized"), (409, "batch_active")] {
+        let server = Server::new(move |_, _| Reply {
+            status,
+            ..Reply::json(json!({ "error": code }))
+        });
+        let error = server
+            .client(2)
+            .start(
+                "update",
+                &[Region {
+                    id: "test-region".into(),
+                    extract: "europe/germany/berlin".into(),
+                }],
+            )
+            .unwrap_err();
+        assert!(!network::retryable(&error), "{error:#}");
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
     }
 }
 
@@ -495,4 +569,41 @@ fn renewal_recovers_from_network_outage_without_losing_a_valid_lease() {
     }
     assert_eq!(guard.lease().unwrap().renew_after_seconds, 60);
     assert_eq!(server.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn truncated_conflict_response_recovers_after_the_inner_retry_budget() {
+    let calls = Mutex::new(0);
+    let server = Server::new(move |path, _| {
+        assert_eq!(path, "/admin/jobs");
+        let mut count = calls.lock().unwrap();
+        *count += 1;
+        if *count <= 3 {
+            Reply {
+                status: 409,
+                truncate: true,
+                ..Reply::json(json!({"error":"lease_lost"}))
+            }
+        } else {
+            Reply::json(json!({"batchId":BATCH,"jobs":[]}))
+        }
+    });
+    let client = server.client(2);
+    let jobs = network::retry(Duration::ZERO, || client.jobs()).unwrap();
+    assert_eq!(jobs["batchId"], BATCH);
+    assert_eq!(server.requests.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn truncated_authentication_rejection_does_not_retry_a_denied_request() {
+    for status in [401, 403] {
+        let server = Server::new(move |_, _| Reply {
+            status,
+            truncate: true,
+            ..Reply::json(json!({"error":"unauthorized"}))
+        });
+        let error = server.client(2).jobs().unwrap_err();
+        assert!(!network::retryable(&error), "{error:#}");
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
 }

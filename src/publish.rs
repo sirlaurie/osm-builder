@@ -385,7 +385,7 @@ impl Publisher {
     }
 
     fn backoff(&self, attempt: u32) {
-        thread::sleep(self.retry_delay.saturating_mul(1u32 << attempt));
+        thread::sleep(network::backoff(self.retry_delay, attempt));
     }
 
     pub fn read_state(&self) -> Result<Option<Current>> {
@@ -430,7 +430,7 @@ impl Publisher {
                 }
                 Ok(response) => {
                     let status = response.status().as_u16();
-                    if status < 500 && status != 429 {
+                    if !network::retryable_status(response.status()) {
                         bail!("State request rejected: HTTP {status}");
                     }
                     if attempt + 1 == self.attempts {
@@ -535,7 +535,7 @@ impl Publisher {
             match request.send() {
                 Ok(response) => {
                     let status = response.status();
-                    if !(status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS) {
+                    if !network::retryable_status(status) {
                         return Ok(response);
                     }
                     if attempt + 1 == self.attempts {
@@ -881,9 +881,15 @@ impl Publisher {
                 .json(&json!({ "region": build.release.region, "manifest": build.release.manifest, "lease": lease })).send();
             let status = response.as_ref().ok().map(Response::status);
             if status == Some(StatusCode::CONFLICT) {
-                let error = response.ok().and_then(|response| {
-                    let mut bytes = Vec::new();
-                    response.take(4097).read_to_end(&mut bytes).ok()?;
+                let mut bytes = Vec::new();
+                response
+                    .map_err(network::request)?
+                    .take(4097)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| {
+                        network::Transient("Publish rejection response read failed".into())
+                    })?;
+                let error = (|| {
                     if bytes.len() > 4096 {
                         return None;
                     }
@@ -895,13 +901,20 @@ impl Publisher {
                         "current_too_large" => Some("current_too_large"),
                         _ => None,
                     }
-                });
+                })();
+                if error == Some("lease_lost") {
+                    return Err(network::Transient(
+                        "Publish rejected: lease_lost; acquire a current lease before retrying"
+                            .into(),
+                    )
+                    .into());
+                }
                 bail!("Publish rejected: {}", error.unwrap_or("HTTP 409"));
             }
             if let Some(status) = status.filter(|status| {
                 !status.is_success()
                     && status.as_u16() < 500
-                    && *status != StatusCode::TOO_MANY_REQUESTS
+                    && !network::retryable_status(*status)
                     && *status != StatusCode::CONFLICT
             }) {
                 bail!("Publish rejected: HTTP {}", status.as_u16());
@@ -909,7 +922,7 @@ impl Publisher {
             let acknowledged = (|| -> Result<()> {
                 let response = response.map_err(network::request)?;
                 let status = response.status();
-                if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+                if network::retryable_status(status) {
                     return Err(network::Transient(format!(
                         "Publish request failed: HTTP {}",
                         status.as_u16()

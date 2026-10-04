@@ -1411,7 +1411,7 @@ fn publication_uses_the_same_lease_after_other_regions_change() {
 }
 
 #[test]
-fn publication_fences_a_reassigned_lease_without_retrying() {
+fn publication_fences_a_reassigned_lease_and_requires_reclaim_before_retrying() {
     let build = Build::new(0);
     let remote = Remote::new(&build);
     let concurrent = json!({ "schema": 1, "revision": NEW_REVISION,
@@ -1426,6 +1426,7 @@ fn publication_fences_a_reassigned_lease_without_retrying() {
         .publish(build.path(), &lease(), |_| {})
         .unwrap_err();
     assert!(error.to_string().contains("lease_lost"));
+    assert!(network::retryable(&error));
     let remote = remote.lock().unwrap();
     assert_eq!(remote.publish_leases.len(), 1);
     assert_eq!(remote.current, concurrent);
@@ -1485,13 +1486,15 @@ fn publication_uncertain_responses_stop_at_the_configured_attempt_limit() {
 fn publication_existing_manifest_requires_a_completion_acknowledgement() {
     for reply in [
         Reply::status(503),
+        Reply::status(408),
+        Reply::status(425),
         Reply::json(&json!({ "success": true, "revision": REVISION })),
         Reply {
             body: format!("{TOKEN} {SECRET}").into_bytes(),
             ..Reply::status(200)
         },
     ] {
-        let transient = reply.status == 503;
+        let transient = matches!(reply.status, 408 | 425 | 503);
         let build = Build::new(0);
         let remote = Remote::new(&build);
         {
@@ -1578,6 +1581,7 @@ fn publication_nonrevision_conflicts_are_sanitized_and_not_retried() {
             assert!(message.contains(code), "{message}");
         }
         assert!(!message.contains(TOKEN) && !message.contains(SECRET));
+        assert_eq!(network::retryable(&error), code == Some("lease_lost"));
         assert_eq!(remote.lock().unwrap().publish_leases.len(), 1);
         assert!(!build.path().join("publish-receipt.json").exists());
     }
@@ -1617,6 +1621,8 @@ fn acknowledged_publish_must_be_current_and_receipt_symlink_is_not_followed() {
 fn state_errors_are_bounded_sanitized_and_redirects_never_followed() {
     for (status, attempts, message) in [
         (503, 3, "State request failed"),
+        (408, 3, "State request failed"),
+        (425, 3, "State request failed"),
         (401, 1, "State request rejected"),
         (302, 1, "State request rejected"),
     ] {
@@ -1628,7 +1634,10 @@ fn state_errors_are_bounded_sanitized_and_redirects_never_followed() {
             ..Reply::status(status)
         });
         let error = publisher(&server, &[]).read_state().unwrap_err();
-        assert_eq!(network::retryable(&error), status == 503);
+        assert_eq!(
+            network::retryable(&error),
+            matches!(status, 408 | 425 | 503)
+        );
         let error = error.to_string();
         assert!(error.contains(message));
         assert!(!error.contains(TOKEN) && !error.contains(SECRET));
@@ -1693,6 +1702,24 @@ fn state_body_truncation_and_timeout_retry_but_invalid_schema_does_not() {
     );
     assert_eq!(server.events().len(), 2);
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn interrupted_publish_rejection_keeps_the_task_retryable_without_a_receipt() {
+    let build = Build::new(0);
+    let remote = Remote::new(&build);
+    remote.lock().unwrap().publish_replies.push_back(Reply {
+        headers: vec![("Content-Length".into(), "200".into())],
+        body: br#"{"error":"lease_"#.to_vec(),
+        ..Reply::status(409)
+    });
+    let server = Remote::server(&remote);
+    let error = publisher(&server, &[("OSM_HTTP_ATTEMPTS", "2")])
+        .publish(build.path(), &lease(), |_| {})
+        .unwrap_err();
+    assert!(network::retryable(&error), "{error:#}");
+    assert_eq!(remote.lock().unwrap().publish_leases.len(), 1);
+    assert!(!build.path().join("publish-receipt.json").exists());
 }
 
 #[test]

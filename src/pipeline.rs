@@ -157,7 +157,8 @@ impl Downloader {
                 .to_string_lossy()
         ));
         self.executor().block_on(async {
-            for attempt in 0..=runtime.download_retries {
+            let mut attempt = 0_u32;
+            loop {
                 let result = self
                     .download_attempt(runtime, url, &partial, timeout, limit)
                     .await;
@@ -167,21 +168,25 @@ impl Downloader {
                         return Ok(());
                     }
                     Err(error)
-                        if attempt < runtime.download_retries
+                        if (self.control.is_none() || attempt < runtime.download_retries)
                             && crate::network::retryable(&error) =>
                     {
                         self.check_cancelled()?;
                         progress::message(&format!(
                             "Download attempt {} failed: {error}",
-                            attempt + 1
+                            attempt.saturating_add(1)
                         ));
-                        self.interruptible(tokio::time::sleep(runtime.download_retry_delay))
-                            .await?;
+                        let delay = crate::network::retry_delay(
+                            &error,
+                            runtime.download_retry_delay,
+                            attempt,
+                        );
+                        self.interruptible(tokio::time::sleep(delay)).await?;
+                        attempt = attempt.saturating_add(1);
                     }
                     Err(error) => return Err(error),
                 }
             }
-            unreachable!()
         })
     }
 
@@ -295,18 +300,23 @@ impl Downloader {
             .await?
             .map_err(|_| crate::network::Transient("Download request timed out".into()))?
             .map_err(crate::network::request)?;
-        if response.status().as_u16() == 429
-            && let Some(delay) = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(retry_after)
-        {
-            self.interruptible(tokio::time::sleep(delay)).await?;
+        if !response.status().is_success() {
+            let error = anyhow::Error::new(crate::network::Transient(format!(
+                "Source download failed: HTTP {} at {url}",
+                response.status()
+            )));
+            return Err(
+                match response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(retry_after)
+                {
+                    Some(delay) => error.context(crate::network::RetryAfter(delay)),
+                    None => error,
+                },
+            );
         }
-        response = response
-            .error_for_status()
-            .map_err(crate::network::request)?;
         if let (Some(length), Some(limit)) = (response.content_length(), limit) {
             ensure!(length <= limit, "Download exceeds limit: {url}");
         }
@@ -395,7 +405,7 @@ impl Downloader {
         }
         source::prepare(entry, catalog, job)?;
         let url = entry.source_url();
-        progress::message(&format!("[{}] Downloading initial source: {url}", entry.id));
+        progress::message(&format!("[{}] Preparing source snapshot: {url}", entry.id));
         self.snapshot(
             runtime,
             &SourceIdentity::from_replication_url(&entry.updates_url())?,
@@ -414,43 +424,59 @@ impl Downloader {
     }
 
     fn snapshot(&self, runtime: &Runtime, identity: &SourceIdentity, job: &Path) -> Result<()> {
+        self.snapshot_with_download(runtime, identity, job, |url, path, limit| {
+            self.download(runtime, url, path, limit)
+        })
+    }
+
+    fn snapshot_with_download(
+        &self,
+        runtime: &Runtime,
+        identity: &SourceIdentity,
+        job: &Path,
+        mut download: impl FnMut(&str, &Path, Option<u64>) -> Result<()>,
+    ) -> Result<()> {
         let checksum = identity.checksum_url()?;
-        for attempt in 0..=runtime.download_retries {
-            self.download(runtime, &checksum, &job.join("before.md5"), Some(4096))?;
-            self.download(
-                runtime,
-                &identity.source_url()?,
-                &job.join("source.osm.pbf"),
-                None,
-            )?;
-            self.download(runtime, &checksum, &job.join("source.md5"), Some(4096))?;
+        let pbf = job.join("source.osm.pbf");
+        let stored_checksum = job.join("source.md5");
+        let mut attempt = 0_u32;
+        loop {
+            self.check_cancelled()?;
+            download(&checksum, &job.join("before.md5"), Some(4096))?;
+            let reused = pbf.is_file()
+                && source::stamp(&pbf, &job.join("before.md5"), &identity.replication_url).is_ok();
+            if !reused {
+                download(&identity.source_url()?, &pbf, None)?;
+            }
+            download(&checksum, &stored_checksum, Some(4096))?;
             if fs::read(job.join("before.md5"))? != fs::read(job.join("source.md5"))? {
-                if attempt == runtime.download_retries {
+                if self.control.is_some() && attempt >= runtime.download_retries {
                     return Err(crate::network::Transient(
                         "Source snapshot changed during download".into(),
                     )
                     .into());
                 }
-                continue;
-            }
-            let stamp = source::stamp(
-                &job.join("source.osm.pbf"),
-                &job.join("source.md5"),
-                &identity.replication_url,
-            );
-            if let Err(error) = stamp {
-                if attempt == runtime.download_retries {
-                    return Err(error);
+            } else {
+                let stamp = if reused {
+                    Ok(())
+                } else {
+                    source::stamp(&pbf, &stored_checksum, &identity.replication_url).map(|_| ())
+                };
+                match stamp {
+                    Ok(()) => return Ok(()),
+                    Err(error) if attempt >= runtime.download_retries => return Err(error),
+                    Err(_) => {}
                 }
-                self.executor().block_on(async {
-                    self.interruptible(tokio::time::sleep(runtime.download_retry_delay))
-                        .await
-                })?;
-                continue;
             }
-            return Ok(());
+            self.executor().block_on(async {
+                self.interruptible(tokio::time::sleep(crate::network::backoff(
+                    runtime.download_retry_delay,
+                    attempt,
+                )))
+                .await
+            })?;
+            attempt = attempt.saturating_add(1);
         }
-        unreachable!()
     }
 }
 
@@ -685,11 +711,24 @@ impl Operations<'_> {
                     .map(|(flow, _)| flow.download.lock().expect("download lock"));
                 let downloads = data.join(".downloads");
                 fs::create_dir_all(&downloads)?;
-                let job = tempfile::Builder::new()
-                    .prefix(&format!("{}-", entry.id))
-                    .rand_bytes(10)
-                    .tempdir_in(&downloads)?
-                    .keep();
+                let retained = retained_download(data, entry, &self.identity(entry)?)?;
+                let temporary = if retained.is_none() {
+                    Some(
+                        tempfile::Builder::new()
+                            .prefix(&format!("{}-", entry.id))
+                            .rand_bytes(10)
+                            .tempdir_in(&downloads)?,
+                    )
+                } else {
+                    None
+                };
+                let job = retained.unwrap_or_else(|| {
+                    temporary
+                        .as_ref()
+                        .expect("New download directory")
+                        .path()
+                        .to_path_buf()
+                });
                 if let Some(source) = self.source {
                     self.downloader
                         .fallback_snapshot(self.runtime, source, &job)?;
@@ -697,7 +736,10 @@ impl Operations<'_> {
                     self.downloader
                         .source_snapshot(self.runtime, entry, &self.catalog, &job)?;
                 }
-                job
+                match temporary {
+                    Some(temporary) => temporary.keep(),
+                    None => job,
+                }
             }
         };
         ensure!(
@@ -967,6 +1009,51 @@ fn managed_download(name: &str, entry: &Region) -> bool {
         })
 }
 
+fn retained_download(
+    data: &Path,
+    entry: &Region,
+    identity: &SourceIdentity,
+) -> Result<Option<PathBuf>> {
+    let downloads = data.join(".downloads");
+    reject_symlinks(&[data, &downloads])?;
+    if !downloads.try_exists()? {
+        return Ok(None);
+    }
+    let mut jobs = fs::read_dir(&downloads)?.collect::<std::io::Result<Vec<_>>>()?;
+    jobs.sort_by_key(|job| job.file_name());
+    let source = identity.source_url()?;
+    for job in jobs {
+        if !job
+            .file_name()
+            .to_str()
+            .is_some_and(|name| managed_download(name, entry))
+        {
+            continue;
+        }
+        let path = job.path();
+        reject_symlinks(&[&path])?;
+        if !path.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(&path)? {
+            reject_symlinks(&[&file?.path()])?;
+        }
+        if [
+            "source.url",
+            "source.osm.pbf",
+            "source.md5",
+            "coverage.json",
+        ]
+        .iter()
+        .all(|name| path.join(name).is_file())
+            && fs::read_to_string(path.join("source.url"))?.trim() == source
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
 fn validate_release(path: &Path, entry: &Region, manifest: &str) -> Result<()> {
     let release: Value = serde_json::from_slice(&fs::read(path)?)?;
     ensure!(
@@ -1170,7 +1257,9 @@ fn execute_regions(
                 }
             }
             if command == "init" {
-                operations.initialize(entry, data, job, None)?;
+                crate::network::retry(Duration::from_secs(60), || {
+                    operations.initialize(entry, data, job, None)
+                })?;
                 return Ok(());
             }
             if command == "bootstrap" {
@@ -1435,7 +1524,12 @@ trait WorkOperations: Sync {
     }
 }
 
-fn execute_work(operations: &impl WorkOperations, once: bool, cleanup: bool) -> Result<()> {
+fn execute_work(
+    operations: &impl WorkOperations,
+    once: bool,
+    cleanup: bool,
+    published: &AtomicBool,
+) -> Result<()> {
     let flow = Arc::new(PipelineFlow::new(cleanup));
     std::thread::scope(|scope| {
         let mut workers = Vec::new();
@@ -1508,6 +1602,7 @@ fn execute_work(operations: &impl WorkOperations, once: bool, cleanup: bool) -> 
                         let _upload = flow.upload.lock().expect("upload lock");
                         flow.check()?;
                         operations.publish(&task, &output, &flow.cancelled)?;
+                        published.store(true, Ordering::Release);
                         if cleanup {
                             operations.cleanup(&task, &output)?;
                         }
@@ -1559,15 +1654,23 @@ fn wait_for_work(
     once: bool,
     cleanup: bool,
     retry_delay: Duration,
+    mut sleep: impl FnMut(Duration),
 ) -> Result<()> {
+    let published = AtomicBool::new(false);
+    let mut attempt = 0_u32;
     loop {
-        match execute_work(operations, once, cleanup) {
+        match execute_work(operations, once, cleanup, &published) {
             Err(error) if crate::network::retryable(&error) => {
+                if published.swap(false, Ordering::AcqRel) {
+                    attempt = 0;
+                }
+                let delay = crate::network::retry_delay(&error, retry_delay, attempt);
                 progress::message(&format!(
                     "Network unavailable: {error:#}; retrying work in {}s",
-                    retry_delay.as_secs()
+                    delay.as_secs()
                 ));
-                thread::sleep(retry_delay);
+                sleep(delay);
+                attempt = attempt.saturating_add(1);
             }
             result => return result,
         }
@@ -1803,7 +1906,15 @@ impl WorkOperations for CloudWork<'_> {
             .prefix("catalog-")
             .tempdir_in(&self.scratch)?;
         flow.check()?;
-        if !data.join(&entry.id).try_exists()? && !candidate.try_exists()? {
+        if !data.join(&entry.id).try_exists()?
+            && !candidate.try_exists()?
+            && retained_download(
+                data,
+                &entry,
+                &SourceIdentity::from_replication_url(&entry.updates_url())?,
+            )?
+            .is_none()
+        {
             let control = flow.control(slot);
             task.prefetch = Some(Prefetch::controlled(
                 self.runtime,
@@ -2036,6 +2147,7 @@ pub fn work(
         once,
         cleanup,
         Duration::from_secs(60),
+        thread::sleep,
     )
 }
 
@@ -2434,7 +2546,7 @@ mod tests {
     #[test]
     fn distributed_pipeline_overlaps_compute_upload_and_next_prefetch_with_two_regions() {
         let operations = ScheduleOperations::new(ScheduleCase::Overlap);
-        execute_work(&operations, true, true).unwrap();
+        execute_work(&operations, true, true, &AtomicBool::new(false)).unwrap();
         let state = operations.state.lock().unwrap();
         assert_eq!(state.maximum, 2);
         assert_eq!(state.active, 0);
@@ -2502,6 +2614,10 @@ mod tests {
             Ok(())
         }
         fn compute(&self, _: &mut (), flow: &Arc<PipelineFlow>, _: usize) -> Result<()> {
+            if self.stage == "source-http" {
+                let attempt = self.failures.fetch_add(1, Ordering::SeqCst);
+                return download_response(if attempt < 16 { 404 } else { 200 }, None);
+            }
             if self.stage == "replication-head" {
                 let attempt = self.failures.fetch_add(1, Ordering::SeqCst);
                 let anchor = source::replication_state(
@@ -2561,7 +2677,7 @@ mod tests {
                     cleaned: AtomicUsize::new(0),
                     releases: Mutex::new(Vec::new()),
                 };
-                let result = wait_for_work(&operations, true, true, Duration::from_millis(1));
+                let result = wait_for_work(&operations, true, true, Duration::ZERO, |_| {});
                 assert_eq!(result.is_err(), fatal, "{stage}");
                 assert_eq!(
                     operations.cleaned.load(Ordering::SeqCst),
@@ -2583,6 +2699,38 @@ mod tests {
     }
 
     #[test]
+    fn work_keeps_retrying_missing_source_files_until_the_source_recovers() {
+        let operations = RecoveringWork {
+            stage: "source-http",
+            fatal: false,
+            failures: AtomicUsize::new(0),
+            occupied: AtomicBool::new(false),
+            acknowledged: AtomicBool::new(false),
+            cleaned: AtomicUsize::new(0),
+            releases: Mutex::new(Vec::new()),
+        };
+        let mut delays = Vec::new();
+        let result = wait_for_work(&operations, true, true, Duration::from_secs(60), |delay| {
+            delays.push(delay.as_secs());
+        });
+        assert!(
+            result.is_ok(),
+            "work exited instead of waiting for the source: {result:?}"
+        );
+        assert_eq!(operations.failures.load(Ordering::SeqCst), 17);
+        assert_eq!(*operations.releases.lock().unwrap(), vec!["retry"; 16]);
+        assert_eq!(
+            delays,
+            [
+                60, 120, 240, 480, 960, 1920, 3840, 7680, 15360, 30720, 61440, 86400, 86400, 86400,
+                86400, 86400
+            ]
+        );
+        assert_eq!(operations.cleaned.load(Ordering::SeqCst), 1);
+        assert!(operations.acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn work_keeps_retrying_a_stale_replication_head_until_the_source_catches_up() {
         let operations = RecoveringWork {
             stage: "replication-head",
@@ -2593,7 +2741,7 @@ mod tests {
             cleaned: AtomicUsize::new(0),
             releases: Mutex::new(Vec::new()),
         };
-        let result = wait_for_work(&operations, true, true, Duration::ZERO);
+        let result = wait_for_work(&operations, true, true, Duration::ZERO, |_| {});
         assert!(
             result.is_ok(),
             "work exited instead of waiting for the source: {result:?}"
@@ -2637,7 +2785,7 @@ mod tests {
     #[test]
     fn distributed_pipeline_waits_for_confirmed_cleanup_before_computing_on_low_disk() {
         let operations = ScheduleOperations::new(ScheduleCase::LowDisk);
-        execute_work(&operations, true, true).unwrap();
+        execute_work(&operations, true, true, &AtomicBool::new(false)).unwrap();
         let state = operations.state.lock().unwrap();
         let position = |event: &str| {
             state
@@ -2654,7 +2802,7 @@ mod tests {
     #[test]
     fn next_claim_cannot_overtake_a_waiting_prefetch_for_the_compute_turn() {
         let operations = ScheduleOperations::new(ScheduleCase::ComputeOrder);
-        execute_work(&operations, true, true).unwrap();
+        execute_work(&operations, true, true, &AtomicBool::new(false)).unwrap();
         let state = operations.state.lock().unwrap();
         let position = |event: &str| {
             state
@@ -2671,7 +2819,7 @@ mod tests {
     #[test]
     fn distributed_pipeline_failure_retains_builds_and_stops_claiming_or_publishing_more_regions() {
         let operations = ScheduleOperations::new(ScheduleCase::UploadFailure);
-        let error = execute_work(&operations, true, true).unwrap_err();
+        let error = execute_work(&operations, true, true, &AtomicBool::new(false)).unwrap_err();
         assert!(error.to_string().contains("Injected upload failure"));
         let state = operations.state.lock().unwrap();
         assert_eq!(state.next, 2);
@@ -2854,6 +3002,77 @@ mod tests {
     }
 
     #[test]
+    fn source_http_errors_remain_retryable_without_consuming_error_bodies() {
+        for status in 300..600 {
+            let error = download_response(status, None).unwrap_err();
+            assert!(
+                crate::network::retryable(&error),
+                "HTTP {status}: {error:#}"
+            );
+            assert!(error.to_string().contains(&status.to_string()), "{error:#}");
+            assert!(
+                error.to_string().contains("/000/004/919.state.txt"),
+                "{error:#}"
+            );
+        }
+        let error = download_response(429, Some("172800")).unwrap_err();
+        assert_eq!(
+            crate::network::retry_delay(&error, Duration::from_secs(60), 0),
+            Duration::from_secs(86_400)
+        );
+    }
+
+    fn download_response(status: u16, retry_after: Option<&'static str>) -> Result<()> {
+        use std::{io::BufRead, net::TcpListener};
+
+        let work = work();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/000/004/919.state.txt",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = String::new();
+            let mut reader = std::io::BufReader::new(&mut stream);
+            while !request.ends_with("\r\n\r\n") {
+                assert!(reader.read_line(&mut request).unwrap() > 0);
+                assert!(request.len() <= 4096);
+            }
+            let header =
+                retry_after.map_or_else(String::new, |value| format!("Retry-After: {value}\r\n"));
+            write!(
+                stream,
+                "HTTP/1.1 {status} Test\r\n{header}Content-Length: 6\r\nConnection: close\r\n\r\nsource"
+            )
+            .unwrap();
+        });
+        let path = work.path().join("state.txt");
+        fs::write(&path, b"retained").unwrap();
+        let downloader = Downloader::new(&runtime()).unwrap();
+        let result = downloader.executor().block_on(downloader.download_attempt(
+            &runtime(),
+            &url,
+            &path,
+            Duration::from_secs(2),
+            Some(16_384),
+        ));
+        server.join().unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            if status == 200 {
+                &b"source"[..]
+            } else {
+                &b"retained"[..]
+            }
+        );
+        result
+    }
+
+    #[test]
     fn download_stream_rejects_oversized_and_truncated_bodies() {
         use std::net::TcpListener;
         for (response, limit) in [
@@ -2944,6 +3163,265 @@ mod tests {
         fs::write(path.join("source.url"), entry.source_url()).unwrap();
         fs::write(path.join("source.osm.pbf"), b"fixture").unwrap();
         path
+    }
+
+    fn complete_download_job(data: &Path, entry: &Region) -> (PathBuf, Vec<u8>, Vec<u8>) {
+        use md5::{Digest, Md5};
+        let job = data
+            .join(".downloads")
+            .join(format!("{}-retained", entry.id));
+        fs::create_dir_all(&job).unwrap();
+        fs::write(job.join("source.url"), entry.source_url()).unwrap();
+        fs::write(
+            job.join("coverage.json"),
+            r#"{"type":"Polygon","coordinates":[[[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]]]}"#,
+        )
+        .unwrap();
+        let input = crate::test_common::write_pbf(
+            &job,
+            "source",
+            r#"<osm version="0.6"><node id="1" lat="0" lon="0"><tag k="name" v="Cafe"/><tag k="amenity" v="cafe"/></node></osm>"#,
+            &[
+                ("osmosis_replication_timestamp", "2020-01-01T00:00:00Z"),
+                ("osmosis_replication_sequence_number", "42"),
+                ("osmosis_replication_base_url", &entry.updates_url()),
+            ],
+        );
+        let bytes = fs::read(input).unwrap();
+        let checksum = format!("{:x} source.osm.pbf\n", Md5::digest(&bytes)).into_bytes();
+        fs::write(job.join("source.md5"), &checksum).unwrap();
+        (job, bytes, checksum)
+    }
+
+    #[test]
+    fn retained_snapshot_survives_repeated_anchor_404_without_duplicate_downloads() {
+        let data = work();
+        let entry = entry("france");
+        let identity = SourceIdentity::from_replication_url(&entry.updates_url()).unwrap();
+        let (job, bytes, checksum) = complete_download_job(data.path(), &entry);
+        let settings = runtime();
+        let downloader = Downloader::new(&settings).unwrap();
+        let mut pbf_downloads = 0;
+        for attempt in 0..17 {
+            let selected = retained_download(data.path(), &entry, &identity)
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected, job);
+            downloader
+                .snapshot_with_download(&settings, &identity, &selected, |url, path, _| {
+                    if url == identity.checksum_url()? {
+                        fs::write(path, &checksum)?;
+                    } else {
+                        pbf_downloads += 1;
+                        fs::write(path, &bytes)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let anchor = download_response(if attempt < 16 { 404 } else { 200 }, None);
+            assert_eq!(
+                fs::read_dir(data.path().join(".downloads"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            if let Err(error) = anchor {
+                assert!(crate::network::retryable(&error));
+                assert!(!data.path().join(&entry.id).exists());
+                continue;
+            }
+            let metadata = source::stamp(
+                &job.join("source.osm.pbf"),
+                &job.join("source.md5"),
+                &identity.replication_url,
+            )
+            .unwrap();
+            let indexed = incremental::initialize(
+                &incremental::InitOptions {
+                    input: job.join("source.osm.pbf"),
+                    state: data.path().join(&entry.id),
+                    coverage: job.join("coverage.json"),
+                    region: entry.id.clone(),
+                    source_timestamp: metadata.timestamp,
+                    source_sequence: metadata.sequence,
+                    source_sha256: metadata.sha256,
+                    replication_url: metadata.replication_url,
+                },
+                &settings.compute_options(),
+            )
+            .unwrap();
+            assert_eq!(indexed["sequence"], 42);
+            assert_eq!(indexed["count"], 1);
+        }
+        assert_eq!(pbf_downloads, 0);
+        assert_eq!(fs::read(job.join("source.osm.pbf")).unwrap(), bytes);
+        assert!(data.path().join(&entry.id).join("state.sqlite").is_file());
+    }
+
+    #[test]
+    fn retained_snapshot_refreshes_changed_remote_bytes_and_repairs_corrupt_local_bytes() {
+        use md5::{Digest, Md5};
+        let data = work();
+        let entry = entry("france");
+        let identity = SourceIdentity::from_replication_url(&entry.updates_url()).unwrap();
+        let (job, _, _) = complete_download_job(data.path(), &entry);
+        let updated = crate::test_common::write_pbf(
+            data.path(),
+            "updated",
+            r#"<osm version="0.6"><node id="2" lat="0" lon="0"/></osm>"#,
+            &[
+                ("osmosis_replication_timestamp", "2020-01-02T00:00:00Z"),
+                ("osmosis_replication_sequence_number", "43"),
+                ("osmosis_replication_base_url", &entry.updates_url()),
+            ],
+        );
+        let bytes = fs::read(updated).unwrap();
+        let checksum = format!("{:x} source.osm.pbf\n", Md5::digest(&bytes)).into_bytes();
+        let settings = runtime();
+        let downloader = Downloader::new(&settings).unwrap();
+        for corrupt in [false, true] {
+            if corrupt {
+                fs::write(job.join("source.osm.pbf"), b"corrupted").unwrap();
+            }
+            let mut pbf_downloads = 0;
+            downloader
+                .snapshot_with_download(&settings, &identity, &job, |url, path, _| {
+                    if url == identity.checksum_url()? {
+                        fs::write(path, &checksum)?;
+                    } else {
+                        pbf_downloads += 1;
+                        fs::write(path, &bytes)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(pbf_downloads, 1);
+            assert_eq!(
+                fs::read_dir(data.path().join(".downloads"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            assert_eq!(
+                source::stamp(
+                    &job.join("source.osm.pbf"),
+                    &job.join("source.md5"),
+                    &identity.replication_url
+                )
+                .unwrap()
+                .sequence,
+                43
+            );
+        }
+    }
+
+    #[test]
+    fn retained_downloads_require_matching_source_and_reject_symbolic_links() {
+        let data = work();
+        let entry = entry("france");
+        let primary = SourceIdentity::from_replication_url(&entry.updates_url()).unwrap();
+        let alternate = SourceIdentity::from_replication_url(
+            "https://download.openstreetmap.fr/replication/europe/france/minute",
+        )
+        .unwrap();
+        let (job, _, _) = complete_download_job(data.path(), &entry);
+        let candidates = data.path().join(".candidates").join(&entry.id);
+        let (candidate, _, _) = complete_download_job(&candidates, &entry);
+        fs::write(
+            candidate.join("source.url"),
+            alternate.source_url().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            retained_download(data.path(), &entry, &primary).unwrap(),
+            Some(job.clone())
+        );
+        assert!(
+            retained_download(data.path(), &entry, &alternate)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            retained_download(&candidates, &entry, &alternate).unwrap(),
+            Some(candidate)
+        );
+        assert!(
+            retained_download(&candidates, &entry, &primary)
+                .unwrap()
+                .is_none()
+        );
+        let retained = job.join("original.pbf");
+        fs::rename(job.join("source.osm.pbf"), &retained).unwrap();
+        std::os::unix::fs::symlink(&retained, job.join("source.osm.pbf")).unwrap();
+        assert!(retained_download(data.path(), &entry, &primary).is_err());
+        assert!(retained.is_file());
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_remote_data_after_the_inner_limit() {
+        let data = work();
+        let entry = entry("france");
+        let identity = SourceIdentity::from_replication_url(&entry.updates_url()).unwrap();
+        let (job, _, _) = complete_download_job(data.path(), &entry);
+        let mut settings = runtime();
+        settings.download_retries = 1;
+        settings.download_retry_delay = Duration::ZERO;
+        let downloader = Downloader::new(&settings).unwrap();
+        let mut pbf_downloads = 0;
+        let result =
+            downloader.snapshot_with_download(&settings, &identity, &job, |url, path, _| {
+                if url == identity.checksum_url()? {
+                    fs::write(path, b"00000000000000000000000000000000 source.osm.pbf\n")?;
+                } else {
+                    pbf_downloads += 1;
+                    fs::write(path, b"invalid PBF")?;
+                }
+                Ok(())
+            });
+        assert!(!crate::network::retryable(&result.unwrap_err()));
+        assert_eq!(pbf_downloads, 2);
+    }
+
+    #[test]
+    fn standalone_snapshot_retries_source_rollover_beyond_the_inner_limit() {
+        let data = work();
+        let entry = entry("france");
+        let identity = SourceIdentity::from_replication_url(&entry.updates_url()).unwrap();
+        let (job, bytes, checksum) = complete_download_job(data.path(), &entry);
+        let mut settings = runtime();
+        settings.download_retries = 1;
+        settings.download_retry_delay = Duration::ZERO;
+        for controlled in [false, true] {
+            let mut downloader = Downloader::new(&settings).unwrap();
+            if controlled {
+                downloader.control = Some(Arc::new(DownloadControl::default()));
+            }
+            let mut checksums = 0;
+            let result =
+                downloader.snapshot_with_download(&settings, &identity, &job, |url, path, _| {
+                    if url == identity.checksum_url()? {
+                        checksums += 1;
+                        fs::write(
+                            path,
+                            if checksums <= 8 && checksums % 2 == 0 {
+                                b"00000000000000000000000000000000 source.osm.pbf\n".as_slice()
+                            } else {
+                                checksum.as_slice()
+                            },
+                        )?;
+                    } else {
+                        fs::write(path, &bytes)?;
+                    }
+                    Ok(())
+                });
+            if controlled {
+                assert!(crate::network::retryable(&result.unwrap_err()));
+                assert_eq!(checksums, 4);
+            } else {
+                result.unwrap();
+                assert_eq!(checksums, 10);
+            }
+        }
     }
 
     fn marker(data: &Path, entry: &Region, names: &[String]) -> PathBuf {
