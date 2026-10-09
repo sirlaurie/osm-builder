@@ -39,10 +39,24 @@ OSM_PUBLISH_TOKEN="<与 Worker 的 PUBLISH_TOKEN 相同的密钥>"
 | 领取并处理云端任务 | `.build/tools/rust/release/osm work` |
 | 查看批次与设备状态 | `.build/tools/rust/release/osm jobs` |
 | 查看云端已发布地区 | `.build/tools/rust/release/osm published-state` |
+| 取消未完成的批次 | `.build/tools/rust/release/osm cancel` |
+| 从云端发布中移除地区 | `.build/tools/rust/release/osm retire <地区> [<地区> …]` |
+| 统计或删除 R2 中不再引用的对象 | `.build/tools/rust/release/osm gc [--apply]` |
 
-发布完成后，通过 [Worker 查询接口](../osm-worker/README.md) 使用数据。`bootstrap` 和 `update` 中的地区名可替换为 `all`，表示 `config/regions.json` 配置的全部地区。
+发布完成后，通过 [Worker 查询接口](../osm-worker/README.md) 使用数据。`bootstrap` 和 `update` 可列出多个地区，或用 `all` 表示 `config/regions.json` 配置的全部地区。
 
 如需月更，完成 `bootstrap all` 后执行 `.build/tools/rust/release/osm schedule`，在这台 Mac 上安装每月 1 日 04:00 提交全部地区更新批次的任务，处理设备需运行 `work`。
+
+在 Linux 上用 cron 或 systemd timer 提交月更时，先更新代码和配置，再以 `--replace` 提交：
+
+```sh
+cd /path/to/osm-builder && git pull --ff-only && cargo build --release \
+  && .build/tools/rust/release/osm update all --submit-only --replace
+```
+
+`--replace` 先取消上个月未完成的批次，再提交新批次；被取消的地区包含在新批次里。`update all` 提交后会核对云端发布清单，若有已发布地区不在本机 `config/regions.json` 中，会列出这些地区并以非零状态退出，批次仍已提交。此时更新这份仓库，或用 `osm retire` 移除不再提供的地区。让定时任务在非零退出时通知到人，例如 cron 的 `MAILTO` 或 systemd 的 `OnFailure=`。
+
+从配置删除地区不会下线已发布的数据，需执行 `osm retire <地区>`。之后运行 `osm gc --apply` 删除不再被任何已发布 manifest 引用的 R2 对象；不带 `--apply` 时只统计。`gc` 在有未完成批次时拒绝删除，每删除 1000 个对象前重新确认没有新批次，并保留 24 小时内上传的对象。
 
 ## 多设备处理
 
@@ -62,17 +76,19 @@ OSM_PUBLISH_TOKEN="<与 Worker 的 PUBLISH_TOKEN 相同的密钥>"
 
 后续用 `update all --submit-only` 提交更新。这两个命令将所选地区目录提交到 Worker，每次只允许一个批次处于运行状态。`bootstrap` 跳过云端已发布地区；更新已发布地区用 `update`。不带 `--submit-only` 时，提交进程会参与处理并等待批次结束；它与同目录的 `work` 不能并行运行。
 
-`work` 等待后续批次；`work --once` 在当前批次没有待处理或运行中任务时退出。有失败任务时，查看 `jobs` 与设备错误日志，再提交失败地区的批次。若提交结果因断网无法确认，先查看 `jobs`，已有批次用 `work` 继续。
+`work` 等待后续批次；`work --once` 在当前批次没有待处理或运行中任务时退出。有失败任务时，查看 `jobs` 中各任务的 `lastError` 与设备错误日志，再提交失败地区的批次。若提交结果因断网无法确认，先查看 `jobs`，已有批次用 `work` 继续。
 
 网络失败使用指数退避重试，不设总次数上限，每次等待最多 24 小时。此规则覆盖连接超时、传输中断、响应截断、下载重定向次数耗尽，以及派发、R2 和发布接口的 HTTP 408/425/429/5xx。公共源文件的非 2xx 响应全部进入重试，包括 PBF、MD5、目录、复制状态和 OSC 的 404；错误输出保留请求地址与状态码。源端复制状态冲突和没有新序列时的目录覆盖范围变化也会重试，冲突状态不用于推进索引或发布。源站返回的有效 `Retry-After` 与本地退避取较长者，同样封顶 24 小时。
 
-`work` 每轮失败后保留索引和构建产物，任务释放为待重试，等待 60 秒、120 秒、240 秒递增至 24 小时后重新领取。发布成功会重置下一次故障的退避。完整下载会复用；远端 MD5 未变且本地校验通过时跳过 PBF 下载，源文件换代在原受管目录更新，避免失败重试积累完整副本。未确认发布的数据不执行 `--cleanup`。有租约的请求保留有限内层尝试，以便返回工作循环取消在途任务和重新领取；续租等待受原租约期限约束，网络失败不延长期限。
+某个地区遇到网络类失败时，`work` 只把该地区以 `retry` 退回云端，附带失败原因和源站的 `Retry-After`，另一个任务位置继续工作。云端按地区退避，期间所有设备都不领取该地区，`osm jobs` 显示 `retries`、`notBefore` 和 `lastError`。同一设备连续出现网络类失败时，空出的任务位置在领取下一个地区前等待 60 秒、120 秒、240 秒递增至 24 小时，任一地区发布成功后重置。领取请求本身失败时整台设备等待，再次联系上协调器后重置。失败地区的索引和构建产物保留。完整下载会复用；远端 MD5 未变且本地校验通过时跳过 PBF 下载，源文件换代在原受管目录更新，避免失败重试积累完整副本。未确认发布的数据不执行 `--cleanup`。有租约的请求保留有限内层尝试，以便返回工作循环取消在途任务和重新领取；续租等待受原租约期限约束，网络失败不延长期限。
 
 `build/init` 的下载请求、批次提交、`jobs`、`published-state` 和独立 `publish` 均保留进程并重试网络失败。下载和批次提交从配置的请求退避时间起步，其余命令从 60 秒起步；全部封顶 24 小时。批次提交复用同一请求 ID，手工发布重领有效租约，已完成任务须核对原租约、manifest、发布 ACK 与 Current。鉴权拒绝、非 HTTPS 或越权下载重定向、业务数据损坏和磁盘错误不属于网络重试。
 
 每台设备最多持有两个地区的租约，每个租约每 60 秒续期，300 秒未续期后可由其他设备接管。已有索引的设备优先领取；接管设备没有索引时下载完整源建立索引，已有索引时应用日差量。所需序列文件不可用时等待重试，保留索引。
 
-计算 A 时预下载 B，上传 A 时计算 B；A 发布确认并完成清理后，空出的任务位置可领取并预下载 C。每台设备同一时间只计算一个地区、上传一个地区；B 计算结束后若 A 仍在上传，B 等待上传位置。磁盘预算不足时暂停下载或等待前一区域清理；没有可释放空间的任务时退出并保留已有数据。任务失败后停止领取，退回未处理任务，保留失败地区的索引和产物。
+计算 A 时预下载 B，上传 A 时计算 B；A 发布确认并完成清理后，空出的任务位置可领取并预下载 C。每台设备同一时间只计算一个地区、上传一个地区；B 计算结束后若 A 仍在上传，B 等待上传位置。磁盘预算不足时暂停下载或等待前一区域清理；没有可释放空间的任务时退出并保留已有数据。后台预下载因磁盘暂停时，若另一个任务位置需要前台下载，预下载让出下载队列，该地区轮到计算时再前台下载。网络类以外的失败（磁盘、数据损坏、鉴权等）以 `failed` 释放该地区，设备停止领取，退回其他未处理任务，保留失败地区的索引和产物。
+
+`work` 启动时删除中断留下的 `init-*`、`replication-*`、`catalog-*` 临时目录，以及 `.downloads` 中未下载完整的目录；完整下载保留以便复用。
 
 Worker 在同一个 Durable Object 事务中校验租约、合并发布清单并完成任务。失效租约不能发布；不同地区不会因共享版本号而互相覆盖。上传的不可变数据块可复用。
 
@@ -106,4 +122,4 @@ Builder 保留 0.01° 查询网格和每个 POI 的原始数据，将同一 16 �
 
 升级时先部署支持 schema 1 和 2 的 Worker，再更新各设备的 Builder。已发布的旧地区继续可查；`bootstrap all` 会跳过它们，用 `update all --submit-only` 逐地区切换到打包格式。有本地索引时，旧产物转换不需要重新解析 PBF；没有本地索引时仍需下载完整源重建。云端旧对象保留，此次升级不执行 R2 列举或删除。
 
-本地验证使用 `cargo test`。跨仓库联调：在 Worker 目录运行 `npm run test:serve`，将输出的两个回环地址设为 `OSM_TEST_WORKER_URL`、`OSM_TEST_R2_ENDPOINT`，再运行 `cargo test --test worker_integration -- --ignored`；完成后按 Enter 停止服务。此联调使用隔离存储，不产生 Cloudflare 用量。
+本地验证使用 `cargo test`；推送后 GitHub Actions 运行格式、Clippy 和测试检查。POI 判定与网格规则由 `tests/fixtures/poi-contract.json` 约定，Worker 仓库保存同一文件；同级目录存在 `osm-worker` 时，测试会核对两份文件一致。跨仓库联调：在 Worker 目录运行 `npm run test:serve`，将输出的两个回环地址设为 `OSM_TEST_WORKER_URL`、`OSM_TEST_R2_ENDPOINT`，再运行 `cargo test --test worker_integration -- --ignored`；完成后按 Enter 停止服务。此联调使用隔离存储，不产生 Cloudflare 用量。

@@ -1,11 +1,11 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -268,6 +268,16 @@ impl Downloader {
                     runtime.min_free_gib,
                     path.display()
                 );
+            } else if control
+                .pipeline
+                .as_ref()
+                .is_some_and(|(flow, _)| flow.download_waiting.load(Ordering::Acquire) != 0)
+            {
+                progress::message(&format!(
+                    "Prefetch yielded at {}: a foreground download is waiting",
+                    path.display()
+                ));
+                return Err(Yielded.into());
             }
             if !paused {
                 progress::message(&format!(
@@ -611,14 +621,17 @@ impl Prefetch {
                 if let Err(error) = &result
                     && !retry_elsewhere
                     && !thread_control.cancelled.load(Ordering::Acquire)
+                    && error.downcast_ref::<Yielded>().is_none()
                     && let Some((flow, _)) = &thread_control.pipeline
                 {
                     thread_control.failed.store(true, Ordering::Release);
-                    flow.record_failure(crate::network::summary(
-                        error,
-                        format!("Region {} prefetch failed: {error:#}", entry.id),
-                    ));
-                    flow.stop();
+                    if !crate::network::retryable(error) {
+                        flow.record_failure(crate::network::summary(
+                            error,
+                            format!("Region {} prefetch failed: {error:#}", entry.id),
+                        ));
+                        flow.stop();
+                    }
                 }
                 result
             });
@@ -697,10 +710,18 @@ impl Operations<'_> {
             state.display()
         );
         self.check_disks(data, self.runtime.start_free_gib)?;
-        let job = match job {
-            Some(job) => job.canonicalize()?,
-            None if pending.is_some() => pending.expect("Prefetch target matches").consume()?,
-            None => {
+        let prefetched = match pending {
+            Some(pending) if job.is_none() => match pending.consume() {
+                Ok(job) => Some(job),
+                Err(error) if error.downcast_ref::<Yielded>().is_some() => None,
+                Err(error) => return Err(error),
+            },
+            _ => None,
+        };
+        let job = match (job, prefetched) {
+            (Some(job), _) => job.canonicalize()?,
+            (None, Some(prefetched)) => prefetched,
+            (None, None) => {
                 let pipeline = self
                     .downloader
                     .control
@@ -708,7 +729,7 @@ impl Operations<'_> {
                     .and_then(|control| control.pipeline.clone());
                 let _download = pipeline
                     .as_ref()
-                    .map(|(flow, _)| flow.download.lock().expect("download lock"));
+                    .map(|(flow, _)| flow.foreground_download());
                 let downloads = data.join(".downloads");
                 fs::create_dir_all(&downloads)?;
                 let retained = retained_download(data, entry, &self.identity(entry)?)?;
@@ -1054,6 +1075,56 @@ fn retained_download(
     Ok(None)
 }
 
+fn sweep_interrupted(data: &Path, scratch: &Path) -> Result<()> {
+    let downloads = data.join(".downloads");
+    reject_symlinks(&[data, scratch, &downloads])?;
+    let mut targets = Vec::new();
+    for (directory, prefixes) in [
+        (data, &["init-", "replication-"][..]),
+        (scratch, &["catalog-"][..]),
+    ] {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+            {
+                targets.push(entry.path());
+            }
+        }
+    }
+    if downloads.try_exists()? {
+        for entry in fs::read_dir(&downloads)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir()
+                && ![
+                    "source.url",
+                    "source.osm.pbf",
+                    "source.md5",
+                    "coverage.json",
+                ]
+                .iter()
+                .all(|name| path.join(name).is_file())
+            {
+                targets.push(path);
+            }
+        }
+    }
+    for target in &targets {
+        fs::remove_dir_all(target)?;
+    }
+    if !targets.is_empty() {
+        progress::message(&format!(
+            "Removed {} directories left by interrupted work",
+            targets.len()
+        ));
+    }
+    Ok(())
+}
+
 fn validate_release(path: &Path, entry: &Region, manifest: &str) -> Result<()> {
     let release: Value = serde_json::from_slice(&fs::read(path)?)?;
     ensure!(
@@ -1310,21 +1381,72 @@ fn execute_regions(
     Ok(())
 }
 
+fn select_regions(root: &Path, selection: &[String]) -> Result<Vec<Region>> {
+    let entries = source::regions(&root.join("config/regions.json"))?;
+    if selection == ["all"] {
+        return Ok(entries);
+    }
+    ensure!(
+        !selection.is_empty() && !selection.iter().any(|region| region == "all"),
+        "Select all or specific regions, not both"
+    );
+    let mut selected = Vec::new();
+    for region in selection {
+        let entry = entries
+            .iter()
+            .find(|entry| &entry.id == region)
+            .with_context(|| format!("Region is not configured: {region}"))?;
+        if !selected.iter().any(|chosen: &Region| chosen.id == entry.id) {
+            selected.push(entry.clone());
+        }
+    }
+    Ok(selected)
+}
+
 pub fn submit(
     root: &Path,
     runtime: &Runtime,
     environment: &Environment,
     mode: &str,
-    selection: &str,
+    selection: &[String],
+    replace: bool,
 ) -> Result<String> {
-    let entries = source::regions(&root.join("config/regions.json"))?
-        .into_iter()
-        .filter(|entry| selection == "all" || entry.id == selection)
-        .collect::<Vec<_>>();
-    ensure!(!entries.is_empty(), "Region is not configured: {selection}");
-    Publisher::new(runtime, &PublishConfig::from_environment(environment)?)?
-        .coordinator()
-        .start(mode, &entries)
+    let entries = select_regions(root, selection)?;
+    let publisher = Publisher::new(runtime, &PublishConfig::from_environment(environment)?)?;
+    let client = publisher.coordinator();
+    if replace
+        && let Some(cancelled) =
+            crate::network::retry(Duration::from_secs(60), || client.cancel_active())?
+    {
+        println!(
+            "Cancelled unfinished batch {} ({} regions)",
+            cancelled["batchId"].as_str().unwrap_or_default(),
+            cancelled["cancelled"]
+        );
+    }
+    let batch = client.start(mode, &entries)?;
+    if selection == ["all"] {
+        let configured = entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = crate::network::retry(Duration::from_secs(60), || publisher.read_state())?
+            .map(|current| {
+                current
+                    .regions
+                    .into_iter()
+                    .map(|release| release.region)
+                    .filter(|region| !configured.contains(region.as_str()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        ensure!(
+            missing.is_empty(),
+            "Submitted batch {batch}, but published regions are missing from config/regions.json: {}; update this checkout or remove them with osm retire",
+            missing.join(", ")
+        );
+    }
+    Ok(batch)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1335,6 +1457,32 @@ enum WorkPhase {
     Uploading,
 }
 
+#[derive(Default)]
+struct ComputeOrder {
+    next: usize,
+    skipped: BTreeSet<usize>,
+}
+
+impl ComputeOrder {
+    fn advance(&mut self) {
+        self.next += 1;
+        while self.skipped.remove(&self.next) {
+            self.next += 1;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Yielded;
+
+impl std::fmt::Display for Yielded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Paused prefetch yielded the download queue to a foreground download")
+    }
+}
+
+impl std::error::Error for Yielded {}
+
 struct PipelineFlow {
     cancelled: Arc<AtomicBool>,
     phases: Mutex<[WorkPhase; 2]>,
@@ -1342,10 +1490,12 @@ struct PipelineFlow {
     changed: Condvar,
     claims: Mutex<()>,
     issued: AtomicUsize,
-    compute: Mutex<usize>,
+    compute: Mutex<ComputeOrder>,
     compute_changed: Condvar,
     upload: Mutex<()>,
     download: Mutex<()>,
+    download_waiting: AtomicUsize,
+    retry_streak: AtomicU32,
     controls: Mutex<Vec<Weak<DownloadControl>>>,
     failure: Mutex<Option<anyhow::Error>>,
     cleanup: bool,
@@ -1360,10 +1510,12 @@ impl PipelineFlow {
             changed: Condvar::new(),
             claims: Mutex::new(()),
             issued: AtomicUsize::new(0),
-            compute: Mutex::new(0),
+            compute: Mutex::new(ComputeOrder::default()),
             compute_changed: Condvar::new(),
             upload: Mutex::new(()),
             download: Mutex::new(()),
+            download_waiting: AtomicUsize::new(0),
+            retry_streak: AtomicU32::new(0),
             controls: Mutex::new(Vec::new()),
             failure: Mutex::new(None),
             cleanup,
@@ -1453,15 +1605,61 @@ impl PipelineFlow {
             .expect("pipeline wait");
     }
 
+    fn pause(&self, duration: Duration) {
+        let deadline = std::time::Instant::now() + duration;
+        let mut phases = self.phases.lock().expect("pipeline phases lock");
+        while !self.cancelled.load(Ordering::Acquire) {
+            let Some(remaining) = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                break;
+            };
+            phases = self
+                .changed
+                .wait_timeout(phases, remaining)
+                .expect("pipeline pause")
+                .0;
+        }
+    }
+
+    fn idle(&self, slot: usize) {
+        self.sources_ready.lock().expect("source readiness lock")[slot] = true;
+        self.phase(slot, WorkPhase::Idle);
+    }
+
+    fn foreground_download(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.download_waiting.fetch_add(1, Ordering::AcqRel);
+        let download = self.download.lock().expect("download lock");
+        self.download_waiting.fetch_sub(1, Ordering::AcqRel);
+        download
+    }
+
     fn compute_turn(&self, ticket: usize) -> Result<ComputeTurn<'_>> {
-        let mut next = self.compute.lock().expect("compute order lock");
+        let mut order = self.compute.lock().expect("compute order lock");
         loop {
             self.check()?;
-            if *next == ticket {
+            if order.next == ticket {
                 return Ok(ComputeTurn(self));
             }
-            next = self.compute_changed.wait(next).expect("compute order wait");
+            order = self
+                .compute_changed
+                .wait(order)
+                .expect("compute order wait");
         }
+    }
+
+    fn skip_turn(&self, ticket: usize) {
+        let mut order = self
+            .compute
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if order.next == ticket {
+            order.advance();
+        } else {
+            order.skipped.insert(ticket);
+        }
+        self.compute_changed.notify_all();
     }
 }
 
@@ -1469,11 +1667,11 @@ struct ComputeTurn<'a>(&'a PipelineFlow);
 
 impl Drop for ComputeTurn<'_> {
     fn drop(&mut self) {
-        *self
-            .0
+        self.0
             .compute
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) += 1;
+            .unwrap_or_else(|error| error.into_inner())
+            .advance();
         self.0.compute_changed.notify_all();
     }
 }
@@ -1518,7 +1716,12 @@ trait WorkOperations: Sync {
         cancelled: &AtomicBool,
     ) -> Result<()>;
     fn cleanup(&self, task: &Self::Task, output: &Self::Output) -> Result<()>;
-    fn release(&self, task: &mut Self::Task, outcome: dispatch::ReleaseOutcome) -> Result<()>;
+    fn release(
+        &self,
+        task: &mut Self::Task,
+        outcome: dispatch::ReleaseOutcome,
+        error: &anyhow::Error,
+    ) -> Result<()>;
     fn failed(&self, _task: &Self::Task) -> bool {
         false
     }
@@ -1528,7 +1731,8 @@ fn execute_work(
     operations: &impl WorkOperations,
     once: bool,
     cleanup: bool,
-    published: &AtomicBool,
+    retry_delay: Duration,
+    contacted: &AtomicBool,
 ) -> Result<()> {
     let flow = Arc::new(PipelineFlow::new(cleanup));
     std::thread::scope(|scope| {
@@ -1545,6 +1749,7 @@ fn execute_work(
                         }
                         match operations.claim(slot as u8) {
                             Ok(claim) => {
+                                contacted.store(true, Ordering::Release);
                                 let ticket = if matches!(&claim, WorkClaim::Task(_)) {
                                     Some(flow.issued.fetch_add(1, Ordering::Relaxed))
                                 } else { None };
@@ -1573,12 +1778,15 @@ fn execute_work(
                     };
                     let region = operations.region(&task).to_owned();
                     let _label = progress::region(&region);
+                    let ticket = ticket.expect("Claimed task has a compute ticket");
+                    let mut turned = false;
                     flow.phase(slot, WorkPhase::Preparing);
                     let result = (|| -> Result<()> {
                         flow.check()?;
                         operations.prepare(&mut task, &flow, slot)?;
                         let output = {
-                            let _compute = flow.compute_turn(ticket.expect("Claimed task has a compute ticket"))?;
+                            let _compute = flow.compute_turn(ticket)?;
+                            turned = true;
                             let mut waiting = false;
                             loop {
                                 flow.check()?;
@@ -1602,7 +1810,7 @@ fn execute_work(
                         let _upload = flow.upload.lock().expect("upload lock");
                         flow.check()?;
                         operations.publish(&task, &output, &flow.cancelled)?;
-                        published.store(true, Ordering::Release);
+                        flow.retry_streak.store(0, Ordering::Release);
                         if cleanup {
                             operations.cleanup(&task, &output)?;
                         }
@@ -1610,7 +1818,22 @@ fn execute_work(
                         Ok(())
                     })();
                     if let Err(error) = result {
-                        let sibling_cancelled = flow.cancelled.load(Ordering::Acquire) && !operations.failed(&task);
+                        let cancelled = flow.cancelled.load(Ordering::Acquire);
+                        if !cancelled && crate::network::retryable(&error) {
+                            if !turned {
+                                flow.skip_turn(ticket);
+                            }
+                            if let Err(release_error) = operations.release(&mut task, dispatch::ReleaseOutcome::Retry, &error) {
+                                progress::message(&format!("Could not release task: {release_error:#}"));
+                            }
+                            drop(task);
+                            flow.idle(slot);
+                            let delay = crate::network::retry_delay(&error, retry_delay, flow.retry_streak.fetch_add(1, Ordering::AcqRel));
+                            progress::message(&format!("Region {region} returned for retry: {error:#}; next claim in {}s", delay.as_secs()));
+                            flow.pause(delay);
+                            continue;
+                        }
+                        let sibling_cancelled = cancelled && !operations.failed(&task);
                         let outcome = if crate::network::retryable(&error) || sibling_cancelled {
                             dispatch::ReleaseOutcome::Retry
                         } else {
@@ -1620,7 +1843,7 @@ fn execute_work(
                             flow.record_failure(crate::network::summary(&error, format!("Region {region} failed: {error:#}")));
                         }
                         flow.stop();
-                        if let Err(release_error) = operations.release(&mut task, outcome) {
+                        if let Err(release_error) = operations.release(&mut task, outcome, &error) {
                             progress::message(&format!("Could not release task: {release_error:#}"));
                         }
                         return Err(error.context(format!("Region {region} failed")));
@@ -1656,12 +1879,12 @@ fn wait_for_work(
     retry_delay: Duration,
     mut sleep: impl FnMut(Duration),
 ) -> Result<()> {
-    let published = AtomicBool::new(false);
+    let contacted = AtomicBool::new(false);
     let mut attempt = 0_u32;
     loop {
-        match execute_work(operations, once, cleanup, &published) {
+        match execute_work(operations, once, cleanup, retry_delay, &contacted) {
             Err(error) if crate::network::retryable(&error) => {
-                if published.swap(false, Ordering::AcqRel) {
+                if contacted.swap(false, Ordering::AcqRel) {
                     attempt = 0;
                 }
                 let delay = crate::network::retry_delay(&error, retry_delay, attempt);
@@ -2099,9 +2322,14 @@ impl WorkOperations for CloudWork<'_> {
         )
     }
 
-    fn release(&self, task: &mut Self::Task, outcome: dispatch::ReleaseOutcome) -> Result<()> {
+    fn release(
+        &self,
+        task: &mut Self::Task,
+        outcome: dispatch::ReleaseOutcome,
+        error: &anyhow::Error,
+    ) -> Result<()> {
         task.prefetch = None;
-        self.client.release(&task.lease, outcome)
+        self.client.release(&task.lease, outcome, error)
     }
 
     fn failed(&self, task: &Self::Task) -> bool {
@@ -2129,6 +2357,7 @@ pub fn work(
     let client = publisher.coordinator();
     let scratch = root.join(".build/tools/tmp");
     fs::create_dir_all(&scratch)?;
+    sweep_interrupted(data, &scratch)?;
     println!("Device {device}: waiting for regional tasks");
     wait_for_work(
         &CloudWork {
@@ -2241,7 +2470,7 @@ pub fn run(
     runtime: &Runtime,
     environment: &Environment,
     command: &str,
-    selection: &str,
+    selection: &[String],
     job: Option<&Path>,
     cleanup: bool,
 ) -> Result<()> {
@@ -2258,14 +2487,10 @@ pub fn run(
         "Only init accepts an existing downloaded job"
     );
     ensure!(
-        command != "init" || selection != "all",
+        command != "init" || (selection.len() == 1 && selection[0] != "all"),
         "init requires one region; use bootstrap all for the initial batch"
     );
-    let mut entries = source::regions(&root.join("config/regions.json"))?;
-    if selection != "all" {
-        entries.retain(|entry| entry.id == selection);
-    }
-    ensure!(!entries.is_empty(), "Region is not configured: {selection}");
+    let entries = select_regions(root, selection)?;
     if command != "init" {
         let publisher = Publisher::new(runtime, &PublishConfig::from_environment(environment)?)?;
         if cleanup {
@@ -2346,6 +2571,8 @@ mod tests {
         LowDisk,
         UploadFailure,
         ComputeOrder,
+        RetryUpload,
+        RetryPrepare,
     }
 
     #[derive(Default)]
@@ -2439,6 +2666,9 @@ mod tests {
             if *task == "b" && self.case == ScheduleCase::ComputeOrder {
                 self.wait_for("claim:c");
             }
+            if *task == "b" && self.case == ScheduleCase::RetryPrepare {
+                return Err(crate::network::Transient("Injected catalog timeout".into()).into());
+            }
             Ok(())
         }
 
@@ -2490,7 +2720,9 @@ mod tests {
                             flow.wait(Duration::from_millis(10));
                         }
                     }
-                    ScheduleCase::ComputeOrder => {}
+                    ScheduleCase::ComputeOrder
+                    | ScheduleCase::RetryUpload
+                    | ScheduleCase::RetryPrepare => {}
                 }
             } else if *task == "c" && self.case == ScheduleCase::ComputeOrder {
                 self.wait_for("computed:b");
@@ -2507,7 +2739,12 @@ mod tests {
                 assert_eq!(state.uploads, 1);
             }
             self.event(&format!("upload:{task}"));
-            if *task == "a" && self.case != ScheduleCase::ComputeOrder {
+            if *task == "a"
+                && !matches!(
+                    self.case,
+                    ScheduleCase::ComputeOrder | ScheduleCase::RetryPrepare
+                )
+            {
                 self.wait_for(if self.case == ScheduleCase::LowDisk {
                     "wait:b"
                 } else {
@@ -2519,6 +2756,9 @@ mod tests {
                 *task != "a" || self.case != ScheduleCase::UploadFailure,
                 "Injected upload failure"
             );
+            if *task == "a" && self.case == ScheduleCase::RetryUpload {
+                return Err(crate::network::Transient("Injected upload timeout".into()).into());
+            }
             self.event(&format!("ack:{task}"));
             Ok(())
         }
@@ -2532,7 +2772,12 @@ mod tests {
             Ok(())
         }
 
-        fn release(&self, task: &mut Self::Task, outcome: dispatch::ReleaseOutcome) -> Result<()> {
+        fn release(
+            &self,
+            task: &mut Self::Task,
+            outcome: dispatch::ReleaseOutcome,
+            _: &anyhow::Error,
+        ) -> Result<()> {
             let outcome = match outcome {
                 dispatch::ReleaseOutcome::Failed => "failed",
                 dispatch::ReleaseOutcome::Retry => "retry",
@@ -2546,7 +2791,14 @@ mod tests {
     #[test]
     fn distributed_pipeline_overlaps_compute_upload_and_next_prefetch_with_two_regions() {
         let operations = ScheduleOperations::new(ScheduleCase::Overlap);
-        execute_work(&operations, true, true, &AtomicBool::new(false)).unwrap();
+        execute_work(
+            &operations,
+            true,
+            true,
+            Duration::ZERO,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         let state = operations.state.lock().unwrap();
         assert_eq!(state.maximum, 2);
         assert_eq!(state.active, 0);
@@ -2649,7 +2901,12 @@ mod tests {
             self.cleaned.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn release(&self, _: &mut (), outcome: dispatch::ReleaseOutcome) -> Result<()> {
+        fn release(
+            &self,
+            _: &mut (),
+            outcome: dispatch::ReleaseOutcome,
+            _: &anyhow::Error,
+        ) -> Result<()> {
             assert!(!self.acknowledged.load(Ordering::SeqCst));
             assert_eq!(self.cleaned.load(Ordering::SeqCst), 0);
             self.releases.lock().unwrap().push(match outcome {
@@ -2699,7 +2956,7 @@ mod tests {
     }
 
     #[test]
-    fn work_keeps_retrying_missing_source_files_until_the_source_recovers() {
+    fn work_returns_missing_source_files_for_retry_without_restarting_the_device() {
         let operations = RecoveringWork {
             stage: "source-http",
             fatal: false,
@@ -2710,7 +2967,7 @@ mod tests {
             releases: Mutex::new(Vec::new()),
         };
         let mut delays = Vec::new();
-        let result = wait_for_work(&operations, true, true, Duration::from_secs(60), |delay| {
+        let result = wait_for_work(&operations, true, true, Duration::ZERO, |delay| {
             delays.push(delay.as_secs());
         });
         assert!(
@@ -2719,15 +2976,42 @@ mod tests {
         );
         assert_eq!(operations.failures.load(Ordering::SeqCst), 17);
         assert_eq!(*operations.releases.lock().unwrap(), vec!["retry"; 16]);
-        assert_eq!(
-            delays,
-            [
-                60, 120, 240, 480, 960, 1920, 3840, 7680, 15360, 30720, 61440, 86400, 86400, 86400,
-                86400, 86400
-            ]
-        );
+        assert!(delays.is_empty(), "{delays:?}");
         assert_eq!(operations.cleaned.load(Ordering::SeqCst), 1);
         assert!(operations.acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_retryable_region_failure_keeps_the_other_slot_running_and_skips_its_compute_turn() {
+        for case in [ScheduleCase::RetryUpload, ScheduleCase::RetryPrepare] {
+            let operations = ScheduleOperations::new(case);
+            execute_work(
+                &operations,
+                true,
+                true,
+                Duration::ZERO,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let state = operations.state.lock().unwrap();
+            let failed = if case == ScheduleCase::RetryUpload {
+                "a"
+            } else {
+                "b"
+            };
+            for event in [
+                format!("release:{failed}:retry"),
+                "ack:c".into(),
+                format!("ack:{}", if failed == "a" { "b" } else { "a" }),
+            ] {
+                assert!(state.events.contains(&event), "{event}: {:?}", state.events);
+            }
+            assert!(
+                !state.events.iter().any(|event| event.ends_with(":failed")),
+                "{:?}",
+                state.events
+            );
+        }
     }
 
     #[test]
@@ -2785,7 +3069,14 @@ mod tests {
     #[test]
     fn distributed_pipeline_waits_for_confirmed_cleanup_before_computing_on_low_disk() {
         let operations = ScheduleOperations::new(ScheduleCase::LowDisk);
-        execute_work(&operations, true, true, &AtomicBool::new(false)).unwrap();
+        execute_work(
+            &operations,
+            true,
+            true,
+            Duration::ZERO,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         let state = operations.state.lock().unwrap();
         let position = |event: &str| {
             state
@@ -2802,7 +3093,14 @@ mod tests {
     #[test]
     fn next_claim_cannot_overtake_a_waiting_prefetch_for_the_compute_turn() {
         let operations = ScheduleOperations::new(ScheduleCase::ComputeOrder);
-        execute_work(&operations, true, true, &AtomicBool::new(false)).unwrap();
+        execute_work(
+            &operations,
+            true,
+            true,
+            Duration::ZERO,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         let state = operations.state.lock().unwrap();
         let position = |event: &str| {
             state
@@ -2819,7 +3117,14 @@ mod tests {
     #[test]
     fn distributed_pipeline_failure_retains_builds_and_stops_claiming_or_publishing_more_regions() {
         let operations = ScheduleOperations::new(ScheduleCase::UploadFailure);
-        let error = execute_work(&operations, true, true, &AtomicBool::new(false)).unwrap_err();
+        let error = execute_work(
+            &operations,
+            true,
+            true,
+            Duration::ZERO,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("Injected upload failure"));
         let state = operations.state.lock().unwrap();
         assert_eq!(state.next, 2);
@@ -2936,6 +3241,37 @@ mod tests {
     }
 
     #[test]
+    fn region_selection_accepts_all_or_configured_regions_in_request_order() {
+        let root = work();
+        fs::create_dir_all(root.path().join("config")).unwrap();
+        fs::write(
+            root.path().join("config/regions.json"),
+            r#"{"regions":[{"id":"a","extract":"europe/a"},{"id":"b","extract":"europe/b"}]}"#,
+        )
+        .unwrap();
+        let select = |selection: &[&str]| {
+            select_regions(
+                root.path(),
+                &selection
+                    .iter()
+                    .map(|id| (*id).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(select(&["all"]).unwrap(), ["a", "b"]);
+        assert_eq!(select(&["b", "a", "b"]).unwrap(), ["b", "a"]);
+        for invalid in [&["all", "a"][..], &["missing"], &[]] {
+            assert!(select(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn invalid_commands_have_no_filesystem_or_network_effects() {
         let work = work();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2954,7 +3290,7 @@ mod tests {
                     &runtime,
                     &Environment::default(),
                     command,
-                    selection,
+                    &[selection.to_owned()],
                     job,
                     cleanup
                 )
@@ -4177,6 +4513,108 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"content");
         task.join().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_paused_prefetch_yields_the_download_queue_to_a_waiting_foreground_download() {
+        use std::net::TcpListener;
+        let work = work();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/source", server.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut stream, _) = server.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncontent",
+                )
+                .unwrap();
+        });
+        let mut settings = runtime();
+        settings.start_free_gib =
+            fs2::available_space(work.path()).unwrap() / (1024 * 1024 * 1024) + 1;
+        let flow = Arc::new(PipelineFlow::new(true));
+        let background = flow.control(1);
+        let path = work.path().join("source.part");
+        let thread_flow = Arc::clone(&flow);
+        let thread_path = path.clone();
+        let prefetch = std::thread::spawn(move || {
+            let _download = thread_flow.download.lock().unwrap();
+            let mut downloader = Downloader::new(&settings).unwrap();
+            downloader.control = Some(background);
+            downloader.executor().block_on(downloader.download_attempt(
+                &settings,
+                &url,
+                &thread_path,
+                Duration::from_secs(5),
+                None,
+            ))
+        });
+        let until = std::time::Instant::now() + Duration::from_secs(3);
+        while !path.exists() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(path.exists());
+        let (acquired, acquired_rx) = std::sync::mpsc::channel();
+        let waiter_flow = Arc::clone(&flow);
+        let waiter = std::thread::spawn(move || {
+            let _download = waiter_flow.foreground_download();
+            acquired.send(()).unwrap();
+        });
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("A paused prefetch kept the download queue from the foreground");
+        let error = prefetch.join().unwrap().unwrap_err();
+        assert!(error.downcast_ref::<Yielded>().is_some(), "{error:#}");
+        assert!(!flow.cancelled.load(Ordering::Acquire));
+        waiter.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn interrupted_work_directories_are_removed_but_complete_downloads_are_kept() {
+        let work = work();
+        let data = work.path().join("data");
+        let scratch = work.path().join("scratch");
+        let complete = data.join(".downloads/au-nsw-complete");
+        for directory in [
+            data.join("init-a1"),
+            data.join("replication-b2"),
+            data.join("au-nsw"),
+            scratch.join("catalog-c3"),
+            scratch.join("other"),
+            data.join(".downloads/au-nsw-partial"),
+            complete.clone(),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            data.join(".downloads/au-nsw-partial/source.osm.pbf.part"),
+            b"x",
+        )
+        .unwrap();
+        for name in [
+            "source.url",
+            "source.osm.pbf",
+            "source.md5",
+            "coverage.json",
+        ] {
+            fs::write(complete.join(name), b"x").unwrap();
+        }
+        sweep_interrupted(&data, &scratch).unwrap();
+        for (path, kept) in [
+            (data.join("init-a1"), false),
+            (data.join("replication-b2"), false),
+            (scratch.join("catalog-c3"), false),
+            (data.join(".downloads/au-nsw-partial"), false),
+            (data.join("au-nsw"), true),
+            (scratch.join("other"), true),
+            (complete, true),
+        ] {
+            assert_eq!(path.exists(), kept, "{}", path.display());
+        }
     }
 
     #[test]

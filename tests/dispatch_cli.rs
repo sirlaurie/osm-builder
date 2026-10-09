@@ -221,6 +221,10 @@ fn submit_only_and_jobs_bypass_the_lock_held_by_a_processing_device() {
             assert_eq!(request.method, "GET");
             json!({"batchId": BATCH, "pending": 1, "running": 0, "failed": 0})
         }
+        "/admin/state" => {
+            assert_eq!(request.method, "GET");
+            Value::Null
+        }
         path => panic!("Unexpected request: {} {path}", request.method),
     });
     let project = project(&server.url);
@@ -258,9 +262,22 @@ fn submit_only_and_jobs_bypass_the_lock_held_by_a_processing_device() {
     assert_eq!(jobs["pending"], 1);
 
     let requests = server.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    for (request, mode) in requests[..2].iter().zip(["bootstrap", "update"]) {
-        assert_eq!(request.path, "/admin/jobs/start");
+    let paths = requests
+        .iter()
+        .map(|request| request.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        [
+            "/admin/jobs/start",
+            "/admin/state",
+            "/admin/jobs/start",
+            "/admin/state",
+            "/admin/jobs"
+        ]
+    );
+    let starts = [&requests[0], &requests[2]];
+    for (request, mode) in starts.iter().zip(["bootstrap", "update"]) {
         assert_eq!(request.body["mode"], mode);
         assert_eq!(
             request.body["regions"],
@@ -268,6 +285,59 @@ fn submit_only_and_jobs_bypass_the_lock_held_by_a_processing_device() {
         );
         assert_eq!(request.body["requestId"].as_str().unwrap().len(), 36);
     }
-    assert_ne!(requests[0].body["requestId"], requests[1].body["requestId"]);
-    assert_eq!(requests[2].path, "/admin/jobs");
+    assert_ne!(starts[0].body["requestId"], starts[1].body["requestId"]);
+}
+
+#[test]
+fn replacing_submission_cancels_the_unfinished_batch_and_reports_unconfigured_publications() {
+    const OLD: &str = "10000000-0000-4000-8000-000000000002";
+    let releases = ["retired-region", "test-region"].map(|region| {
+        json!({
+            "region": region,
+            "manifest": "a".repeat(64),
+            "sourceTimestamp": "2026-10-01T00:00:00Z",
+            "bbox": [0.0, 0.0, 1.0, 1.0],
+        })
+    });
+    let server = Server::new(move |request| match request.path.as_str() {
+        "/admin/jobs" => json!({"batchId": OLD, "finishedAt": null}),
+        "/admin/jobs/cancel" => {
+            assert_eq!(request.body, json!({"batchId": OLD}));
+            json!({"batchId": OLD, "cancelled": 3})
+        }
+        "/admin/jobs/start" => json!({"batchId": BATCH}),
+        "/admin/state" => json!({
+            "schema": 1,
+            "revision": "10000000-0000-4000-8000-000000000003",
+            "regions": releases,
+        }),
+        path => panic!("Unexpected request: {} {path}", request.method),
+    });
+    let project = project(&server.url);
+
+    let output = invoke(
+        project.path(),
+        &["update", "all", "--submit-only", "--replace"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(BATCH), "{stderr}");
+    assert!(stderr.contains("retired-region"), "{stderr}");
+    assert!(!stderr.contains("test-region"), "{stderr}");
+    let paths = server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| request.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        [
+            "/admin/jobs",
+            "/admin/jobs/cancel",
+            "/admin/jobs/start",
+            "/admin/state"
+        ]
+    );
 }

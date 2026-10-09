@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use aura_osm::{
     build,
     config::{Environment, Runtime},
-    dispatch, format, incremental, network, pipeline,
+    dispatch, format, gc, incremental, network, pipeline,
     publish::{ProgressReporter, PublishConfig, Publisher},
     schedule, source,
 };
@@ -50,9 +50,16 @@ enum Action {
     },
     #[command(about = "Initialize, update and publish regions")]
     Bootstrap {
-        region: String,
+        #[arg(required = true)]
+        regions: Vec<String>,
         #[arg(long, help = "Submit the batch without claiming tasks on this process")]
         submit_only: bool,
+        #[arg(
+            long,
+            requires = "submit_only",
+            help = "Cancel an unfinished batch before submitting"
+        )]
+        replace: bool,
         #[arg(
             long,
             help = "Remove each region's local data after confirmed publication"
@@ -61,9 +68,31 @@ enum Action {
     },
     #[command(about = "Submit regional updates and process the batch")]
     Update {
-        region: String,
+        #[arg(required = true)]
+        regions: Vec<String>,
         #[arg(long, help = "Submit the batch without claiming tasks on this process")]
         submit_only: bool,
+        #[arg(
+            long,
+            requires = "submit_only",
+            help = "Cancel an unfinished batch before submitting"
+        )]
+        replace: bool,
+    },
+    #[command(about = "Cancel the unfinished cloud batch")]
+    Cancel,
+    #[command(about = "Remove regions from cloud publication")]
+    Retire {
+        #[arg(required = true)]
+        regions: Vec<String>,
+    },
+    #[command(about = "Report or delete R2 objects that no published region references")]
+    Gc {
+        #[arg(
+            long,
+            help = "Delete the unreferenced objects instead of reporting them"
+        )]
+        apply: bool,
     },
     #[command(about = "Claim and process cloud regional tasks")]
     Work {
@@ -164,9 +193,10 @@ fn run(cli: Cli) -> Result<()> {
     let runtime = Runtime::load(&root, &environment)?;
     match &cli.command {
         Action::Bootstrap {
-            region,
+            regions,
             cleanup,
             submit_only: true,
+            replace,
         } => {
             ensure!(
                 !cleanup,
@@ -174,24 +204,38 @@ fn run(cli: Cli) -> Result<()> {
             );
             println!(
                 "Submitted batch: {}",
-                pipeline::submit(&root, &runtime, &environment, "bootstrap", region)?
+                pipeline::submit(
+                    &root,
+                    &runtime,
+                    &environment,
+                    "bootstrap",
+                    regions,
+                    *replace
+                )?
             );
             return Ok(());
         }
         Action::Update {
-            region,
+            regions,
             submit_only: true,
+            replace,
         } => {
             println!(
                 "Submitted batch: {}",
-                pipeline::submit(&root, &runtime, &environment, "update", region)?
+                pipeline::submit(&root, &runtime, &environment, "update", regions, *replace)?
             );
             return Ok(());
         }
         _ => {}
     }
     let _lock = match cli.command {
-        Action::List | Action::Jobs | Action::PublishedState | Action::Schedule { .. } => None,
+        Action::List
+        | Action::Jobs
+        | Action::PublishedState
+        | Action::Schedule { .. }
+        | Action::Cancel
+        | Action::Retire { .. }
+        | Action::Gc { .. } => None,
         _ => Some(lock_pipeline(&root)?),
     };
     match cli.command {
@@ -220,27 +264,27 @@ fn run(cli: Cli) -> Result<()> {
             &runtime,
             &environment,
             "init",
-            &region,
+            std::slice::from_ref(&region),
             job.as_deref(),
             false,
         )?,
         Action::Bootstrap {
-            region, cleanup, ..
+            regions, cleanup, ..
         } => pipeline::run(
             &root,
             &runtime,
             &environment,
             "bootstrap",
-            &region,
+            &regions,
             None,
             cleanup,
         )?,
-        Action::Update { region, .. } => pipeline::run(
+        Action::Update { regions, .. } => pipeline::run(
             &root,
             &runtime,
             &environment,
             "update",
-            &region,
+            &regions,
             None,
             false,
         )?,
@@ -287,8 +331,11 @@ fn run(cli: Cli) -> Result<()> {
                     || lease.region != entry.id
                     || lease.extract != entry.extract
                 {
-                    let _ = client.release(&lease, dispatch::ReleaseOutcome::Retry);
-                    bail!("Publication claim does not match the submitted regional task");
+                    let error = anyhow::anyhow!(
+                        "Publication claim does not match the submitted regional task"
+                    );
+                    let _ = client.release(&lease, dispatch::ReleaseOutcome::Retry, &error);
+                    return Err(error);
                 }
                 previous = Some(lease.clone());
                 let result = (|| {
@@ -302,7 +349,7 @@ fn run(cli: Cli) -> Result<()> {
                     } else {
                         dispatch::ReleaseOutcome::Failed
                     };
-                    if let Err(release_error) = client.release(&lease, outcome) {
+                    if let Err(release_error) = client.release(&lease, outcome, error) {
                         eprintln!("Could not release publication task: {release_error:#}");
                     }
                 }
@@ -319,6 +366,28 @@ fn run(cli: Cli) -> Result<()> {
             print_json(&network::retry(Duration::from_secs(60), || {
                 publisher.coordinator().jobs()
             })?)?;
+        }
+        Action::Cancel => {
+            let publisher =
+                Publisher::new(&runtime, &PublishConfig::from_environment(&environment)?)?;
+            match network::retry(Duration::from_secs(60), || {
+                publisher.coordinator().cancel_active()
+            })? {
+                Some(result) => print_json(&result)?,
+                None => println!("No unfinished batch"),
+            }
+        }
+        Action::Retire { regions } => {
+            let publisher =
+                Publisher::new(&runtime, &PublishConfig::from_environment(&environment)?)?;
+            print_json(&network::retry(Duration::from_secs(60), || {
+                publisher.coordinator().retire(&regions)
+            })?)?;
+        }
+        Action::Gc { apply } => {
+            let publisher =
+                Publisher::new(&runtime, &PublishConfig::from_environment(&environment)?)?;
+            print_json(&gc::run(&publisher, apply)?)?;
         }
         Action::PublishedState => {
             let publisher =

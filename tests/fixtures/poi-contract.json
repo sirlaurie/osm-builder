@@ -1,0 +1,38 @@
+{
+  "pois": [
+    { "tags": { "name": "Cafe", "amenity": "cafe" }, "poi": true },
+    { "tags": { "amenity": "cafe" }, "poi": false },
+    { "tags": { "name": " \t ", "amenity": "cafe" }, "poi": false },
+    { "tags": { "name": "﻿", "amenity": "cafe" }, "poi": false },
+    { "tags": { "name": "　", "amenity": "cafe" }, "poi": false },
+    { "tags": { "name": "\u0085", "amenity": "cafe" }, "poi": true },
+    { "tags": { "name:zh-Hant": "咖啡", "amenity": "cafe" }, "poi": true },
+    { "tags": { "NAME:EN": "Cafe", "amenity": "cafe" }, "poi": true },
+    { "tags": { "Name": "Cafe", "amenity": "cafe" }, "poi": false },
+    { "tags": { "name:EN": "Cafe", "amenity": "cafe" }, "poi": true },
+    { "tags": { "int_name": "Cafe", "amenity": "cafe" }, "poi": true },
+    { "tags": { "name:1234": "Cafe", "amenity": "cafe" }, "poi": false },
+    { "tags": { "official_name": "Cafe", "amenity": "cafe" }, "poi": false },
+    { "tags": { "name": "Toilets", "amenity": "toilets" }, "poi": false },
+    {
+      "tags": { "name": "Kiosk", "amenity": "toilets", "shop": "kiosk" },
+      "poi": true
+    },
+    { "tags": { "name": "Shop", "shop": "" }, "poi": false },
+    { "tags": { "name": "Halt", "railway": "halt" }, "poi": true },
+    { "tags": { "name": "Hotel", "tourism": "hotel" }, "poi": true },
+    { "tags": { "name": "Park", "leisure": "park" }, "poi": true },
+    { "tags": { "name": "Stop", "highway": "bus_stop" }, "poi": true },
+    { "tags": { "name": "Road", "highway": "primary" }, "poi": false },
+    { "tags": { "name": "Clinic", "healthcare": "clinic" }, "poi": true },
+    { "tags": { "name": "ATM", "amenity": "atm" }, "poi": true }
+  ],
+  "cells": [
+    { "lat": -33.87, "lon": 151.21, "cell": "5613_33121" },
+    { "lat": -89.98, "lon": -179.95, "cell": "1_5" },
+    { "lat": 0.07, "lon": 0.07, "cell": "9007_18007" },
+    { "lat": 51.5074, "lon": -0.1278, "cell": "14150_17987" },
+    { "lat": 0, "lon": 180, "cell": "9000_0" },
+    { "lat": 90, "lon": -180, "cell": "17999_0" }
+  ]
+}

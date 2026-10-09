@@ -940,6 +940,46 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    const CONTRACT: &str = include_str!("../tests/fixtures/poi-contract.json");
+
+    #[test]
+    fn poi_acceptance_and_grid_cells_follow_the_contract_shared_with_the_worker() {
+        let worker = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../osm-worker/tests/fixtures/poi-contract.json");
+        if worker.exists() {
+            assert_eq!(
+                fs::read_to_string(worker).unwrap(),
+                CONTRACT,
+                "Builder and Worker contract fixtures differ"
+            );
+        }
+        let contract: Value = serde_json::from_str(CONTRACT).unwrap();
+        for case in contract["pois"].as_array().unwrap() {
+            let tags: BTreeMap<String, String> =
+                serde_json::from_value(case["tags"].clone()).unwrap();
+            assert_eq!(
+                crate::format::is_poi(&tags),
+                case["poi"].as_bool().unwrap(),
+                "{tags:?}"
+            );
+        }
+        for case in contract["cells"].as_array().unwrap() {
+            let latitude = case["lat"].as_f64().unwrap();
+            let longitude = case["lon"].as_f64().unwrap();
+            let output = encode_poi(PoiInput {
+                kind: "node".into(),
+                id: 1,
+                tags: "{}".into(),
+                west: longitude,
+                south: latitude,
+                east: longitude,
+                north: latitude,
+            })
+            .unwrap();
+            assert_eq!(output.cell, case["cell"].as_str().unwrap(), "{case}");
+        }
+    }
+
     #[test]
     fn exclusion_diagnostics_do_not_scan_unrelated_relation_references() {
         let work = test_common::work("exclusion-budget-");

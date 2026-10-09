@@ -14,6 +14,7 @@ use aws_sigv4::http_request::{
     UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
+use md5::Digest;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
@@ -25,6 +26,98 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+
+const MAX_LISTING: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredObject {
+    pub key: String,
+    pub size: u64,
+    pub modified: chrono::DateTime<chrono::Utc>,
+}
+
+fn parse_listing(bytes: &[u8]) -> Result<(Vec<StoredObject>, bool)> {
+    let mut reader = quick_xml::Reader::from_reader(bytes);
+    let mut buffer = Vec::new();
+    let mut path: Vec<String> = Vec::new();
+    let mut fields = BTreeMap::<String, String>::new();
+    let mut objects = Vec::new();
+    let mut truncated = None;
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            quick_xml::events::Event::Start(start) => {
+                path.push(start.local_name().as_ref().to_owned());
+            }
+            quick_xml::events::Event::End(_) => {
+                if path.last().is_some_and(|name| name == "Contents") {
+                    let field = |name: &str| {
+                        fields
+                            .get(name)
+                            .with_context(|| "R2 listing entry is incomplete".to_owned())
+                    };
+                    objects.push(StoredObject {
+                        key: field("Key")?.clone(),
+                        size: field("Size")?.parse()?,
+                        modified: chrono::DateTime::parse_from_rfc3339(field("LastModified")?)?
+                            .with_timezone(&chrono::Utc),
+                    });
+                    fields.clear();
+                }
+                path.pop();
+            }
+            quick_xml::events::Event::Text(text) => match path.as_slice() {
+                [.., parent, name]
+                    if parent == "Contents"
+                        && matches!(name.as_str(), "Key" | "Size" | "LastModified") =>
+                {
+                    ensure!(
+                        fields
+                            .insert(name.clone(), text.into_inner().into_owned())
+                            .is_none(),
+                        "R2 listing entry repeats a field"
+                    );
+                }
+                [_, name] if name == "IsTruncated" => {
+                    truncated = Some(text.into_inner() == "true");
+                }
+                _ => {}
+            },
+            quick_xml::events::Event::GeneralRef(_)
+                if path.last().is_some_and(|name| name == "Key") =>
+            {
+                bail!("R2 listing contains an escaped object key")
+            }
+            quick_xml::events::Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok((
+        objects,
+        truncated.context("R2 listing has no truncation flag")?,
+    ))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let value = chunk
+            .iter()
+            .enumerate()
+            .fold(0_u32, |value, (index, byte)| {
+                value | (u32::from(*byte) << (16 - 8 * index))
+            });
+        for index in 0..4 {
+            text.push(if index <= chunk.len() {
+                char::from(TABLE[(value >> (18 - 6 * index)) as usize & 63])
+            } else {
+                '='
+            });
+        }
+    }
+    text
+}
 
 pub struct PublishConfig {
     account: String,
@@ -464,28 +557,40 @@ impl Publisher {
             .endpoint
             .join(&format!("{}/{}", self.bucket, object.key))
             .expect("validated object key");
+        let mut headers = HeaderMap::new();
+        if let Some(bytes) = body {
+            headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+            headers.insert(
+                "content-type",
+                HeaderValue::from_static(if object.key.starts_with("packs/") {
+                    "application/octet-stream"
+                } else {
+                    "application/json"
+                }),
+            );
+            headers.insert(
+                "cache-control",
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            );
+            headers.insert("if-none-match", HeaderValue::from_static("*"));
+            headers.insert(
+                "x-amz-meta-sha256",
+                HeaderValue::from_str(&object.hash).expect("validated hash"),
+            );
+        }
+        self.signed(method, &url, &headers, body, cancelled)
+    }
+
+    fn signed(
+        &self,
+        method: Method,
+        url: &Url,
+        base: &HeaderMap,
+        body: Option<&[u8]>,
+        cancelled: &AtomicBool,
+    ) -> Result<Response> {
         for attempt in 0..self.attempts {
-            let mut headers = HeaderMap::new();
-            if let Some(bytes) = body {
-                headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
-                headers.insert(
-                    "content-type",
-                    HeaderValue::from_static(if object.key.starts_with("packs/") {
-                        "application/octet-stream"
-                    } else {
-                        "application/json"
-                    }),
-                );
-                headers.insert(
-                    "cache-control",
-                    HeaderValue::from_static("public, max-age=31536000, immutable"),
-                );
-                headers.insert("if-none-match", HeaderValue::from_static("*"));
-                headers.insert(
-                    "x-amz-meta-sha256",
-                    HeaderValue::from_str(&object.hash).expect("validated hash"),
-                );
-            }
+            let mut headers = base.clone();
             let identity = self.credentials.clone().into();
             let mut settings = SigningSettings::default();
             settings.percent_encoding_mode = PercentEncodingMode::Single;
@@ -555,6 +660,95 @@ impl Publisher {
             self.backoff(attempt);
         }
         bail!("R2 request has no attempts")
+    }
+
+    pub fn list_objects(
+        &self,
+        prefix: &str,
+        cancelled: &AtomicBool,
+        mut page: impl FnMut(Vec<StoredObject>) -> Result<()>,
+    ) -> Result<()> {
+        let mut after: Option<String> = None;
+        loop {
+            let mut url = self.endpoint.join(&self.bucket).expect("validated bucket");
+            url.query_pairs_mut()
+                .append_pair("list-type", "2")
+                .append_pair("max-keys", "1000")
+                .append_pair("prefix", prefix);
+            if let Some(after) = &after {
+                url.query_pairs_mut().append_pair("start-after", after);
+            }
+            let response = self.signed(Method::GET, &url, &HeaderMap::new(), None, cancelled)?;
+            ensure!(
+                response.status().is_success(),
+                "R2 listing rejected: HTTP {}",
+                response.status().as_u16()
+            );
+            let mut bytes = Vec::new();
+            response
+                .take(MAX_LISTING as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| network::Transient("R2 listing response read failed".into()))?;
+            ensure!(bytes.len() <= MAX_LISTING, "R2 listing is too large");
+            let (objects, truncated) = parse_listing(&bytes)?;
+            ensure!(
+                objects.iter().all(|object| object.key.starts_with(prefix)),
+                "R2 listing returned keys outside {prefix}"
+            );
+            let last = objects.last().map(|object| object.key.clone());
+            page(objects)?;
+            if !truncated {
+                return Ok(());
+            }
+            ensure!(last.is_some() && last > after, "R2 listing did not advance");
+            after = last;
+        }
+    }
+
+    pub fn delete_objects(&self, keys: &[String], cancelled: &AtomicBool) -> Result<()> {
+        ensure!(
+            (1..=1000).contains(&keys.len())
+                && keys.iter().all(|key| {
+                    key.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+                    })
+                }),
+            "Invalid R2 deletion batch"
+        );
+        let mut url = self.endpoint.join(&self.bucket).expect("validated bucket");
+        url.set_query(Some("delete"));
+        let mut body = String::from("<Delete><Quiet>true</Quiet>");
+        for key in keys {
+            body.push_str(&format!("<Object><Key>{key}</Key></Object>"));
+        }
+        body.push_str("</Delete>");
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+        headers.insert("content-type", HeaderValue::from_static("application/xml"));
+        headers.insert(
+            "content-md5",
+            HeaderValue::from_str(&base64(&md5::Md5::digest(body.as_bytes())))
+                .expect("base64 header"),
+        );
+        let response = self.signed(
+            Method::POST,
+            &url,
+            &headers,
+            Some(body.as_bytes()),
+            cancelled,
+        )?;
+        let status = response.status();
+        let mut reply = Vec::new();
+        response
+            .take(MAX_LISTING as u64 + 1)
+            .read_to_end(&mut reply)
+            .map_err(|_| network::Transient("R2 deletion response read failed".into()))?;
+        ensure!(
+            status.is_success() && !reply.windows(7).any(|window| window == b"<Error>"),
+            "R2 deletion rejected: HTTP {}",
+            status.as_u16()
+        );
+        Ok(())
     }
 
     fn head(&self, object: &Object, cancelled: &AtomicBool) -> Result<bool> {
@@ -1141,6 +1335,43 @@ impl ReporterState {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn listing_pages_report_keys_sizes_times_and_truncation() {
+        let page = br#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>aura-osm-data</Name><Prefix>packs/</Prefix><KeyCount>2</KeyCount>
+  <MaxKeys>1000</MaxKeys><IsTruncated>true</IsTruncated>
+  <Contents><Key>packs/a.bin</Key><Size>42</Size>
+    <LastModified>2026-09-13T05:49:12.000Z</LastModified><ETag>&quot;x&quot;</ETag></Contents>
+  <Contents><Key>packs/b.bin</Key><Size>7</Size>
+    <LastModified>2026-10-04T06:19:00.000Z</LastModified></Contents>
+</ListBucketResult>"#;
+        let (objects, truncated) = parse_listing(page).unwrap();
+        assert!(truncated);
+        assert_eq!(
+            objects
+                .iter()
+                .map(|object| (
+                    object.key.as_str(),
+                    object.size,
+                    object.modified.to_rfc3339()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("packs/a.bin", 42, "2026-09-13T05:49:12+00:00".to_owned()),
+                ("packs/b.bin", 7, "2026-10-04T06:19:00+00:00".to_owned()),
+            ]
+        );
+        let last = br#"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"#;
+        assert_eq!(parse_listing(last).unwrap(), (Vec::new(), false));
+        assert!(parse_listing(b"<ListBucketResult></ListBucketResult>").is_err());
+    }
+
+    #[test]
+    fn deletion_checksum_matches_the_rfc_1864_empty_body_digest() {
+        assert_eq!(base64(&md5::Md5::digest(b"")), "1B2M2Y8AsgTpgAmY7PhCfg==");
+    }
 
     #[derive(Clone)]
     struct Output(Arc<Mutex<Vec<u8>>>);

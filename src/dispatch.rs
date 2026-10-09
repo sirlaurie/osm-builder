@@ -20,6 +20,7 @@ use crate::{
 };
 
 const MAX_RESPONSE: usize = 1024 * 1024;
+const MAX_ERROR_CHARS: usize = 500;
 const LEASE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
@@ -225,7 +226,9 @@ impl Client {
                                 }
                                 if let Some(
                                     code @ ("batch_active" | "invalid_start" | "invalid_claim"
-                                    | "invalid_lease"),
+                                    | "invalid_lease" | "invalid_release"
+                                    | "invalid_cancel" | "batch_not_found"
+                                    | "invalid_retire" | "region_active"),
                                 ) = code
                                 {
                                     bail!("Dispatch request rejected: {code}");
@@ -356,13 +359,22 @@ impl Client {
         Ok(renewed)
     }
 
-    pub fn release(&self, lease: &Lease, outcome: ReleaseOutcome) -> Result<()> {
+    pub fn release(
+        &self,
+        lease: &Lease,
+        outcome: ReleaseOutcome,
+        error: &anyhow::Error,
+    ) -> Result<()> {
         lease.validate()?;
-        let value = self.request(
-            Method::POST,
-            "/admin/jobs/release",
-            Some(&json!({ "lease": lease, "outcome": outcome })),
-        )?;
+        let mut body = json!({
+            "lease": lease,
+            "outcome": outcome,
+            "error": format!("{error:#}").chars().take(MAX_ERROR_CHARS).collect::<String>(),
+        });
+        if let Some(network::RetryAfter(delay)) = error.downcast_ref::<network::RetryAfter>() {
+            body["retryAfterSeconds"] = json!(delay.min(&network::MAX_RETRY_DELAY).as_secs());
+        }
+        let value = self.request(Method::POST, "/admin/jobs/release", Some(&body))?;
         ensure!(
             value["success"] == true,
             "Invalid dispatch release response"
@@ -372,6 +384,46 @@ impl Client {
 
     pub fn jobs(&self) -> Result<Value> {
         self.request(Method::GET, "/admin/jobs", None)
+    }
+
+    pub fn cancel_active(&self) -> Result<Option<Value>> {
+        let jobs = self.jobs()?;
+        let Some(batch) = jobs["batchId"]
+            .as_str()
+            .filter(|_| jobs["finishedAt"].is_null())
+        else {
+            return Ok(None);
+        };
+        ensure!(valid_uuid(batch), "Invalid dispatch job status");
+        let value = self.request(
+            Method::POST,
+            "/admin/jobs/cancel",
+            Some(&json!({ "batchId": batch })),
+        )?;
+        ensure!(
+            value["batchId"].as_str() == Some(batch) && value["cancelled"].is_u64(),
+            "Invalid dispatch cancel response"
+        );
+        Ok(Some(value))
+    }
+
+    pub fn retire(&self, regions: &[String]) -> Result<Value> {
+        ensure!(
+            (1..=format::MAX_REGIONS).contains(&regions.len())
+                && regions.iter().all(|region| format::is_region(region))
+                && regions.iter().collect::<HashSet<_>>().len() == regions.len(),
+            "Invalid regions to retire"
+        );
+        let value = self.request(
+            Method::POST,
+            "/admin/regions/retire",
+            Some(&json!({ "regions": regions })),
+        )?;
+        ensure!(
+            value["success"] == true && value["removed"].is_array(),
+            "Invalid dispatch retire response"
+        );
+        Ok(value)
     }
 }
 

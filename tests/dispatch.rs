@@ -288,13 +288,48 @@ fn renewal_preserves_fencing_and_release_retries_the_same_lease() {
     let client = server.client(2);
     assert!(client.renew(&lease()).is_err());
     let lease = lease();
-    client.release(&lease, ReleaseOutcome::Failed).unwrap();
-    client.release(&lease, ReleaseOutcome::Retry).unwrap();
+    client
+        .release(
+            &lease,
+            ReleaseOutcome::Failed,
+            &anyhow::anyhow!("Need 10 GiB free"),
+        )
+        .unwrap();
+    let throttled = anyhow::Error::new(network::Transient("HTTP 429".into()))
+        .context(network::RetryAfter(Duration::from_secs(90)));
+    client
+        .release(&lease, ReleaseOutcome::Retry, &throttled)
+        .unwrap();
     let requests = server.requests.lock().unwrap();
     assert_eq!(requests[1].1, requests[2].1);
     assert_eq!(requests[3].1, requests[4].1);
     assert_eq!(requests[1].1["outcome"], "failed");
+    assert_eq!(requests[1].1["error"], "Need 10 GiB free");
+    assert!(requests[1].1.get("retryAfterSeconds").is_none());
     assert_eq!(requests[3].1["outcome"], "retry");
+    assert!(
+        requests[3].1["error"]
+            .as_str()
+            .unwrap()
+            .contains("HTTP 429")
+    );
+    assert_eq!(requests[3].1["retryAfterSeconds"], 90);
+}
+
+#[test]
+fn release_reasons_are_bounded_for_the_coordinator_body_limit() {
+    let server = Server::new(|_, _| Reply::json(json!({ "success": true })));
+    let reason = anyhow::anyhow!("\u{0}".repeat(4096));
+    server
+        .client(1)
+        .release(&lease(), ReleaseOutcome::Retry, &reason)
+        .unwrap();
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests[0].1["error"].as_str().unwrap().chars().count(),
+        500
+    );
+    assert!(serde_json::to_vec(&requests[0].1).unwrap().len() < 4096);
 }
 
 #[test]

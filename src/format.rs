@@ -141,7 +141,12 @@ pub fn is_region(value: &str) -> bool {
 
 pub fn has_name(tags: &BTreeMap<String, String>) -> bool {
     tags.iter().any(|(key, value)| {
-        !value.trim().is_empty() && (key == "name" || key == "int_name" || NAME_KEY.is_match(key))
+        !value
+            .trim_matches(|character: char| {
+                (character.is_whitespace() && character != '\u{85}') || character == '\u{feff}'
+            })
+            .is_empty()
+            && (key == "name" || key == "int_name" || NAME_KEY.is_match(key))
     })
 }
 
