@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/packed.rs"]
+mod packed;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -54,6 +56,8 @@ fn read_output(output: &Path, receipt: &Value) -> (Value, Vec<Value>) {
     let bytes = fs::read(output.join(format!("manifests/{digest}.json"))).unwrap();
     assert_eq!(hash_bytes(&bytes), digest);
     let manifest: Value = serde_json::from_slice(&bytes).unwrap();
+    aura_osm::format::validate_manifest(&manifest).unwrap();
+    let manifest = packed::packed_view(output, &manifest);
     let mut records = Vec::new();
     for hashes in manifest["cells"].as_object().unwrap().values() {
         for page in hashes.as_array().unwrap() {
@@ -77,7 +81,6 @@ fn read_output(output: &Path, receipt: &Value) -> (Value, Vec<Value>) {
         }
     }
     assert_eq!(records.len() as u64, receipt["count"].as_u64().unwrap());
-    aura_osm::format::validate_manifest(&manifest).unwrap();
     (manifest, records)
 }
 
@@ -241,7 +244,8 @@ fn sparse_cells_pack_into_one_object_without_changing_any_logical_block_bytes() 
     xml.push_str("</osm>");
     let (receipt, manifest, records) = compile(work.path(), "sparse", &xml, 2).unwrap();
     assert_eq!(records.len(), 256);
-    assert_eq!(manifest["schema"], 2);
+    assert_eq!(manifest["schema"], 3);
+    assert_eq!(manifest["groups"].as_object().unwrap().len(), 1);
     assert_eq!(manifest["cells"].as_object().unwrap().len(), 256);
     assert_eq!(receipt["blockCount"], 256);
     assert_eq!(receipt["packCount"], 1);
@@ -249,7 +253,7 @@ fn sparse_cells_pack_into_one_object_without_changing_any_logical_block_bytes() 
     let bytes = fs::read(work.path().join(format!("sparse/packs/{pack}.bin"))).unwrap();
     assert_eq!(receipt["packBytes"], bytes.len());
     println!(
-        "Sparse fixture: 256 logical blocks -> 1 physical pack; {} POIs, {} bytes; 257 -> 2 immutable-object PUTs including manifest",
+        "Sparse fixture: 256 logical blocks -> 1 physical pack and 1 group index; {} POIs, {} bytes; 3 immutable-object PUTs including manifest",
         records.len(),
         bytes.len()
     );

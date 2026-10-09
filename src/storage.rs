@@ -66,7 +66,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub fn write_object(output: &Path, directory: &str, payload: &[u8]) -> Result<String> {
     ensure!(
-        matches!(directory, "blocks" | "manifests" | "packs"),
+        matches!(directory, "blocks" | "indexes" | "manifests" | "packs"),
         "Invalid immutable object directory"
     );
     let folder = output.join(directory);

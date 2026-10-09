@@ -1,6 +1,6 @@
 use aura_osm::format::{
     MAX_BLOCK, MAX_PACK, canonical_json, has_name, is_poi, normalize_timestamp, source_metadata,
-    validate_block, validate_coverage, validate_current, validate_manifest,
+    validate_block, validate_coverage, validate_current, validate_index, validate_manifest,
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, path::Path};
@@ -239,6 +239,70 @@ fn manifest_versions_preserve_legacy_reads_and_require_schema_two_packs() {
     for schema in [0, 3] {
         legacy["schema"] = json!(schema);
         assert!(validate_manifest(&legacy).is_err());
+    }
+}
+
+#[test]
+fn indexed_manifests_list_group_indexes_that_own_their_cells_and_packs() {
+    let mut manifest = packed_manifest();
+    let pages = manifest["cells"]["9000_18000"].clone();
+    manifest["schema"] = json!(3);
+    manifest.as_object_mut().unwrap().remove("cells");
+    manifest["groups"] = json!({"562_1125": "9".repeat(64)});
+    let parsed = validate_manifest(&manifest).unwrap();
+    assert_eq!(parsed.groups["562_1125"], "9".repeat(64));
+    let index =
+        json!({"group": "562_1125", "packs": manifest["packs"], "cells": {"9000_18000": pages}});
+    assert_eq!(
+        validate_index(&index, "562_1125").unwrap().cells["9000_18000"].len(),
+        5
+    );
+
+    let mut empty = manifest.clone();
+    empty["groups"] = json!({});
+    empty["packs"] = json!([]);
+    empty["count"] = json!(0);
+    validate_manifest(&empty).unwrap();
+
+    let mut invalid_manifests = Vec::new();
+    for (field, value) in [
+        ("cells", json!({})),
+        ("groups", json!([])),
+        ("groups", json!({"1125_0": "9".repeat(64)})),
+        ("groups", json!({"0_2250": "9".repeat(64)})),
+        ("groups", json!({"562_1125": "bad"})),
+        ("groups", json!({})),
+        ("packs", json!([])),
+    ] {
+        let mut invalid = manifest.clone();
+        invalid[field] = value;
+        invalid_manifests.push(invalid);
+    }
+    let mut missing_groups = manifest.clone();
+    missing_groups.as_object_mut().unwrap().remove("groups");
+    invalid_manifests.push(missing_groups);
+    let mut grouped_legacy = packed_manifest();
+    grouped_legacy["groups"] = json!({"562_1125": "9".repeat(64)});
+    invalid_manifests.push(grouped_legacy);
+    for invalid in invalid_manifests {
+        assert!(validate_manifest(&invalid).is_err(), "{invalid}");
+    }
+
+    assert!(validate_index(&index, "562_1126").is_err());
+    for (field, value) in [
+        ("group", json!("562_1126")),
+        ("packs", json!([])),
+        ("packs", json!(["2".repeat(64), "1".repeat(64)])),
+        (
+            "packs",
+            json!(["1".repeat(64), "2".repeat(64), "3".repeat(64)]),
+        ),
+        ("cells", json!({})),
+        ("cells", json!({"9000_18016": index["cells"]["9000_18000"]})),
+    ] {
+        let mut invalid = index.clone();
+        invalid[field] = value;
+        assert!(validate_index(&invalid, "562_1125").is_err(), "{field}");
     }
 }
 

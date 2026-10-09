@@ -163,6 +163,24 @@ impl Build {
         build
     }
 
+    fn indexed(count: usize) -> Self {
+        let mut build = Self::packed(count);
+        fs::create_dir(build.path().join("indexes")).unwrap();
+        let index = json!({
+            "group": "562_1125", "packs": build.manifest["packs"], "cells": build.manifest["cells"],
+        });
+        let bytes = serde_json::to_vec(&index).unwrap();
+        let hash = hash_bytes(&bytes);
+        let key = format!("indexes/{hash}.json");
+        fs::write(build.path().join(&key), bytes).unwrap();
+        build.keys.push(key);
+        build.manifest["schema"] = json!(3);
+        build.manifest.as_object_mut().unwrap().remove("cells");
+        build.manifest["groups"] = json!({ "562_1125": hash });
+        build.save_manifest();
+        build
+    }
+
     fn new(count: usize) -> Self {
         let directory = temporary();
         fs::create_dir(directory.path().join("blocks")).unwrap();
@@ -962,6 +980,67 @@ fn packed_publication_uploads_physical_objects_once_and_preserves_logical_bytes(
             .count(),
         4
     );
+}
+
+#[test]
+fn indexed_publication_uploads_group_indexes_and_packs_before_the_manifest() {
+    let build = Build::indexed(5);
+    let remote = Remote::new(&build);
+    let server = Remote::server(&remote);
+    let receipt = publisher(&server, &[])
+        .publish(build.path(), &lease(), |_| {})
+        .unwrap();
+    assert_eq!(receipt["uploaded"], 5);
+    let puts: Vec<_> = server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.method == "PUT")
+        .map(|request| request.path.clone())
+        .collect();
+    assert_eq!(puts.len(), 5);
+    assert_eq!(
+        puts.last().unwrap(),
+        &format!("/osm-test/{}", build.manifest_key)
+    );
+    for key in &build.keys {
+        assert!(puts.contains(&format!("/osm-test/{key}")), "{key}");
+    }
+}
+
+#[test]
+fn indexed_builds_require_the_manifest_pack_list_to_match_its_group_indexes() {
+    for case in 0..4 {
+        let mut build = Build::indexed(4);
+        let index = build.keys.last().unwrap().clone();
+        match case {
+            0 => {
+                build.manifest["packs"].as_array_mut().unwrap().pop();
+            }
+            1 => build.manifest["packs"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("f".repeat(64))),
+            2 => {
+                let hash = build.manifest["groups"]["562_1125"].clone();
+                build.manifest["groups"] = json!({ "562_1126": hash });
+            }
+            3 => fs::write(build.path().join(&index), b"{}").unwrap(),
+            _ => unreachable!(),
+        }
+        aura_osm::format::validate_manifest(&build.manifest).unwrap();
+        build.save_manifest();
+        let remote = Remote::new(&build);
+        let server = Remote::server(&remote);
+        assert!(
+            publisher(&server, &[])
+                .publish(build.path(), &lease(), |_| {})
+                .is_err(),
+            "case {case}"
+        );
+        assert!(server.events().is_empty(), "case {case}");
+    }
 }
 
 #[test]

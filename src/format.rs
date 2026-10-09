@@ -18,6 +18,7 @@ use crate::source::SourceIdentity;
 pub const MAX_ID: u64 = 9_007_199_254_740_991;
 pub const MAX_BLOCK: usize = 262_144;
 pub const MAX_PACK: usize = 1_048_576;
+pub const MAX_INDEX: usize = 1_048_576;
 pub const MAX_MANIFEST: usize = 8 * 1024 * 1024;
 pub const MAX_CURRENT: usize = 1024 * 1024;
 pub const MAX_REGIONS: usize = 256;
@@ -77,9 +78,12 @@ pub struct Manifest {
     #[serde(rename = "sourceSHA256")]
     pub source_sha256: String,
     pub coverage: Value,
+    #[serde(default)]
     pub cells: BTreeMap<String, Vec<CellPage>>,
     #[serde(default)]
     pub packs: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<String, String>,
     pub count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excluded_incomplete_relation_count: Option<u64>,
@@ -89,6 +93,13 @@ pub struct Manifest {
         skip_serializing_if = "Option::is_none"
     )]
     pub replication_diff_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GroupIndex {
+    pub group: String,
+    pub packs: Vec<String>,
+    pub cells: BTreeMap<String, Vec<CellPage>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -356,7 +367,7 @@ pub fn validate_manifest(value: &Value) -> Result<Manifest> {
         source.validate()?;
     }
     ensure!(
-        matches!(manifest.schema, 1 | 2)
+        matches!(manifest.schema, 1..=3)
             && is_region(&manifest.region)
             && valid_timestamp(&manifest.source_timestamp)
             && manifest
@@ -374,28 +385,27 @@ pub fn validate_manifest(value: &Value) -> Result<Manifest> {
         "Invalid manifest"
     );
     validate_coverage(&manifest.coverage)?;
-    for (cell, pages) in &manifest.cells {
-        let (y, x) = cell.split_once('_').context("Invalid manifest cell")?;
-        let valid_index = |value: &str, maximum: u32| -> bool {
-            !value.is_empty()
-                && value.bytes().all(|byte| byte.is_ascii_digit())
-                && (value.len() == 1 || !value.starts_with('0'))
-                && value.parse::<u32>().is_ok_and(|n| n <= maximum)
-        };
+    if manifest.schema == 3 {
         ensure!(
-            valid_index(y, 17_999)
-                && valid_index(x, 35_999)
-                && !pages.is_empty()
-                && pages.iter().all(|page| is_hash(page.hash()))
-                && pages
+            value.get("cells").is_none()
+                && value.get("groups").is_some_and(Value::is_object)
+                && value.get("packs").is_some_and(Value::is_array)
+                && sorted_hashes(&manifest.packs)
+                && manifest
+                    .groups
                     .iter()
-                    .map(CellPage::hash)
-                    .collect::<BTreeSet<_>>()
-                    .len()
-                    == pages.len(),
-            "Invalid manifest cell"
+                    .all(|(group, hash)| grid_key(group, 1_124, 2_249) && is_hash(hash))
+                && manifest.groups.is_empty() == (manifest.count == 0)
+                && manifest.packs.is_empty() == (manifest.count == 0),
+            "Invalid indexed manifest"
         );
+        return Ok(manifest);
     }
+    ensure!(
+        value.get("cells").is_some_and(Value::is_object) && value.get("groups").is_none(),
+        "Only schema 3 manifests replace cells with group indexes"
+    );
+    validate_cells(&manifest.cells, None)?;
     ensure!(
         manifest.cells.is_empty() == (manifest.count == 0),
         "Manifest cells do not match count"
@@ -412,43 +422,104 @@ pub fn validate_manifest(value: &Value) -> Result<Manifest> {
         );
     } else {
         ensure!(
-            value.get("packs").is_some_and(Value::is_array)
-                && manifest.packs.iter().all(|hash| is_hash(hash))
-                && manifest.packs.windows(2).all(|pair| pair[0] < pair[1]),
+            value.get("packs").is_some_and(Value::is_array) && sorted_hashes(&manifest.packs),
             "Invalid manifest pack directory"
         );
-        let mut referenced = BTreeSet::new();
-        let mut packs: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
-        for page in manifest.cells.values().flatten() {
-            let CellPage::Packed((hash, pack, offset, length)) = page else {
-                anyhow::bail!("Schema 2 manifest contains a legacy block");
-            };
-            ensure!(
-                referenced.insert(hash)
-                    && *pack < manifest.packs.len()
-                    && *offset <= MAX_PACK
-                    && (1..=MAX_BLOCK).contains(length)
-                    && offset
-                        .checked_add(*length)
-                        .is_some_and(|end| end <= MAX_PACK),
-                "Invalid packed block"
-            );
-            packs.entry(*pack).or_default().push((*offset, *length));
-        }
-        ensure!(
-            packs.len() == manifest.packs.len(),
-            "Manifest contains unreferenced packs"
-        );
-        for blocks in packs.values_mut() {
-            blocks.sort_unstable_by_key(|block| block.0);
-            let mut end = 0;
-            for (offset, length) in blocks {
-                ensure!(*offset == end, "Packed block slices must be contiguous");
-                end += *length;
-            }
-        }
+        validate_packed_pages(&manifest.cells, manifest.packs.len())?;
     }
     Ok(manifest)
+}
+
+pub fn group_of(cell: &str) -> Result<String> {
+    let (y, x) = cell.split_once('_').context("Invalid manifest cell")?;
+    Ok(format!(
+        "{}_{}",
+        y.parse::<u32>()? / 16,
+        x.parse::<u32>()? / 16
+    ))
+}
+
+pub fn validate_index(value: &Value, group: &str) -> Result<GroupIndex> {
+    let index: GroupIndex = serde_json::from_value(value.clone()).context("Invalid group index")?;
+    ensure!(
+        index.group == group
+            && !index.packs.is_empty()
+            && sorted_hashes(&index.packs)
+            && !index.cells.is_empty(),
+        "Invalid group index: {group}"
+    );
+    validate_cells(&index.cells, Some(group))?;
+    validate_packed_pages(&index.cells, index.packs.len())?;
+    Ok(index)
+}
+
+fn grid_key(value: &str, maximum_y: u32, maximum_x: u32) -> bool {
+    let number = |value: &str, maximum: u32| {
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value.len() == 1 || !value.starts_with('0'))
+            && value.parse::<u32>().is_ok_and(|n| n <= maximum)
+    };
+    value
+        .split_once('_')
+        .is_some_and(|(y, x)| number(y, maximum_y) && number(x, maximum_x))
+}
+
+fn sorted_hashes(hashes: &[String]) -> bool {
+    hashes.iter().all(|hash| is_hash(hash)) && hashes.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn validate_cells(cells: &BTreeMap<String, Vec<CellPage>>, group: Option<&str>) -> Result<()> {
+    for (cell, pages) in cells {
+        ensure!(
+            grid_key(cell, 17_999, 35_999)
+                && group.is_none_or(|group| group_of(cell).is_ok_and(|actual| actual == group))
+                && !pages.is_empty()
+                && pages.iter().all(|page| is_hash(page.hash()))
+                && pages
+                    .iter()
+                    .map(CellPage::hash)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == pages.len(),
+            "Invalid manifest cell"
+        );
+    }
+    Ok(())
+}
+
+fn validate_packed_pages(cells: &BTreeMap<String, Vec<CellPage>>, pack_count: usize) -> Result<()> {
+    let mut referenced = BTreeSet::new();
+    let mut packs: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+    for page in cells.values().flatten() {
+        let CellPage::Packed((hash, pack, offset, length)) = page else {
+            anyhow::bail!("Packed cells contain a legacy block");
+        };
+        ensure!(
+            referenced.insert(hash)
+                && *pack < pack_count
+                && *offset <= MAX_PACK
+                && (1..=MAX_BLOCK).contains(length)
+                && offset
+                    .checked_add(*length)
+                    .is_some_and(|end| end <= MAX_PACK),
+            "Invalid packed block"
+        );
+        packs.entry(*pack).or_default().push((*offset, *length));
+    }
+    ensure!(
+        packs.len() == pack_count,
+        "Manifest contains unreferenced packs"
+    );
+    for blocks in packs.values_mut() {
+        blocks.sort_unstable_by_key(|block| block.0);
+        let mut end = 0;
+        for (offset, length) in blocks {
+            ensure!(*offset == end, "Packed block slices must be contiguous");
+            end += *length;
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_current(value: &Value) -> Result<Current> {

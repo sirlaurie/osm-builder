@@ -16,8 +16,9 @@ use crate::{
     publish::{Publisher, StoredObject},
 };
 
-const PREFIXES: [(&str, &str); 3] = [
+const PREFIXES: [(&str, &str); 4] = [
     ("manifests/", ".json"),
+    ("indexes/", ".json"),
     ("packs/", ".bin"),
     ("blocks/", ".json"),
 ];
@@ -114,6 +115,12 @@ fn referenced(publisher: &Publisher, cancelled: &AtomicBool) -> Result<(usize, H
                             release.region
                         );
                         let mut found = vec![format!("manifests/{}.json", release.manifest)];
+                        found.extend(
+                            manifest
+                                .groups
+                                .values()
+                                .map(|index| format!("indexes/{index}.json")),
+                        );
                         found.extend(
                             manifest
                                 .packs

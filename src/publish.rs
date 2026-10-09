@@ -1,7 +1,8 @@
 use crate::config::{Environment, Runtime};
 use crate::dispatch::{self, Lease};
 use crate::format::{
-    self, CellPage, Current, MAX_BLOCK, MAX_CURRENT, MAX_MANIFEST, MAX_PACK, Manifest, Release,
+    self, CellPage, Current, MAX_BLOCK, MAX_CURRENT, MAX_INDEX, MAX_MANIFEST, MAX_PACK, Manifest,
+    Release,
 };
 use crate::network;
 use crate::progress::ProgressLine;
@@ -19,7 +20,7 @@ use reqwest::blocking::{Client, Response};
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -239,6 +240,8 @@ struct BlockSlice<'a> {
     range: Option<(usize, usize)>,
 }
 
+type CellSource<'a> = (&'a BTreeMap<String, Vec<CellPage>>, &'a [String]);
+
 struct ObjectSlices<'a> {
     hash: &'a str,
     maximum: usize,
@@ -264,47 +267,81 @@ fn validate_build(
             && manifest.count == release.count,
         "Release does not match manifest"
     );
+    let mut indexes = Vec::new();
+    for (group, hash) in &manifest.groups {
+        ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
+        let key = format!("indexes/{hash}.json");
+        let index = read_local(&root, &key, MAX_INDEX, Some(hash))?;
+        indexes.push((
+            Object {
+                key,
+                hash: index.hash,
+                size: index.size,
+            },
+            format::validate_index(&index.value, group)?,
+        ));
+    }
+    if manifest.schema == 3 {
+        ensure!(
+            indexes
+                .iter()
+                .flat_map(|(_, index)| &index.packs)
+                .collect::<BTreeSet<_>>()
+                == manifest.packs.iter().collect::<BTreeSet<_>>(),
+            "Manifest pack list does not match its group indexes"
+        );
+    }
+    let sources: Vec<CellSource<'_>> = if manifest.schema == 3 {
+        indexes
+            .iter()
+            .map(|(_, index)| (&index.cells, index.packs.as_slice()))
+            .collect()
+    } else {
+        vec![(&manifest.cells, manifest.packs.as_slice())]
+    };
     let mut groups: BTreeMap<String, ObjectSlices<'_>> = BTreeMap::new();
     let mut hashes = HashSet::new();
-    for (cell, pages) in &manifest.cells {
-        for page in pages {
-            ensure!(
-                hashes.insert(page.hash()),
-                "Repeated block reference: {cell}"
-            );
-            let (key, hash, maximum, range) = match page {
-                CellPage::Legacy(hash) => (
-                    format!("blocks/{hash}.json"),
-                    hash.as_str(),
-                    MAX_BLOCK,
-                    None,
-                ),
-                CellPage::Packed((_, index, offset, length)) => {
-                    let hash = &manifest.packs[*index];
-                    (
-                        format!("packs/{hash}.bin"),
+    for (cells, packs) in &sources {
+        for (cell, pages) in *cells {
+            for page in pages {
+                ensure!(
+                    hashes.insert(page.hash()),
+                    "Repeated block reference: {cell}"
+                );
+                let (key, hash, maximum, range) = match page {
+                    CellPage::Legacy(hash) => (
+                        format!("blocks/{hash}.json"),
                         hash.as_str(),
-                        MAX_PACK,
-                        Some((*offset, *length)),
-                    )
-                }
-            };
-            groups
-                .entry(key)
-                .or_insert_with(|| ObjectSlices {
-                    hash,
-                    maximum,
-                    blocks: Vec::new(),
-                })
-                .blocks
-                .push(BlockSlice {
-                    hash: page.hash(),
-                    cell,
-                    range,
-                });
+                        MAX_BLOCK,
+                        None,
+                    ),
+                    CellPage::Packed((_, index, offset, length)) => {
+                        let hash = &packs[*index];
+                        (
+                            format!("packs/{hash}.bin"),
+                            hash.as_str(),
+                            MAX_PACK,
+                            Some((*offset, *length)),
+                        )
+                    }
+                };
+                groups
+                    .entry(key)
+                    .or_insert_with(|| ObjectSlices {
+                        hash,
+                        maximum,
+                        blocks: Vec::new(),
+                    })
+                    .blocks
+                    .push(BlockSlice {
+                        hash: page.hash(),
+                        cell,
+                        range,
+                    });
+            }
         }
     }
-    let total = groups.len() + 1;
+    let total = groups.len() + indexes.len() + 1;
     progress(Progress {
         completed: Some(0),
         total: Some(total),
@@ -316,7 +353,7 @@ fn validate_build(
     for (key, group) in groups {
         ensure!(!cancelled.load(Ordering::Acquire), "Publication cancelled");
         let (bytes, hash) = read_bytes(&root, &key, group.maximum, Some(group.hash))?;
-        if manifest.schema == 2 {
+        if manifest.schema >= 2 {
             ensure!(
                 group
                     .blocks
@@ -382,18 +419,21 @@ fn validate_build(
             ..Progress::stage("validate")
         });
     }
-    for pages in manifest.cells.values() {
-        for pair in pages.windows(2) {
-            ensure!(
-                boundaries[pair[0].hash()].1 < boundaries[pair[1].hash()].0,
-                "Duplicate or unsorted POI pages"
-            );
+    for (cells, _) in &sources {
+        for pages in cells.values() {
+            for pair in pages.windows(2) {
+                ensure!(
+                    boundaries[pair[0].hash()].1 < boundaries[pair[1].hash()].0,
+                    "Duplicate or unsorted POI pages"
+                );
+            }
         }
     }
     ensure!(
         ids.len() as u64 == manifest.count,
         "Manifest count does not match blocks"
     );
+    objects.extend(indexes.into_iter().map(|(object, _)| object));
     objects.push(Object {
         key: manifest_key,
         hash: local.hash,

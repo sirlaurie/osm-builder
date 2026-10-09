@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/packed.rs"]
+mod packed;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -98,6 +100,8 @@ impl Fixture {
         let bytes = fs::read(output.join(format!("manifests/{digest}.json"))).unwrap();
         assert_eq!(hash_bytes(&bytes), digest);
         let manifest: Value = serde_json::from_slice(&bytes).unwrap();
+        aura_osm::format::validate_manifest(&manifest).unwrap();
+        let manifest = packed::packed_view(&output, &manifest);
         let mut records = BTreeMap::new();
         for hashes in manifest["cells"].as_object().unwrap().values() {
             for page in hashes.as_array().unwrap() {
@@ -125,7 +129,6 @@ impl Fixture {
             }
         }
         assert_eq!(records.len() as u64, manifest["count"].as_u64().unwrap());
-        aura_osm::format::validate_manifest(&manifest).unwrap();
         (manifest, records)
     }
 
@@ -138,6 +141,7 @@ impl Fixture {
         let mut legacy = packed.clone();
         legacy["schema"] = json!(1);
         legacy.as_object_mut().unwrap().remove("packs");
+        legacy.as_object_mut().unwrap().remove("groups");
         for pages in legacy["cells"].as_object_mut().unwrap().values_mut() {
             *pages = json!(
                 pages
@@ -265,7 +269,7 @@ fn applying_a_diff_upgrades_legacy_packing_in_the_same_transaction() {
     fixture.legacy_state();
     let changed = fixture.change("", 11).unwrap();
     assert_eq!(changed["sequence"], 11);
-    assert_eq!(fixture.snapshot().0["schema"], 2);
+    assert_eq!(fixture.snapshot().0["schema"], 3);
     assert_eq!(
         fixture
             .database()
@@ -383,7 +387,10 @@ fn initialization_matches_full_build_and_retains_geometry_without_unselected_tag
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(initialized, fresh_manifest);
+    assert_eq!(
+        initialized,
+        packed::packed_view(&fixture.work.path().join("fresh"), &fresh_manifest)
+    );
     let stored: (String, f64) = fixture
         .database()
         .query_row(
@@ -739,14 +746,17 @@ fn sixty_mixed_diffs_match_osmium_full_snapshot_rebuilds() {
                 &fixture.compute,
             )
             .unwrap();
-            let reference: Value = serde_json::from_slice(
-                &fs::read(output.join(format!(
-                    "manifests/{}.json",
-                    receipt["manifest"].as_str().unwrap()
-                )))
+            let reference = packed::packed_view(
+                &output,
+                &serde_json::from_slice(
+                    &fs::read(output.join(format!(
+                        "manifests/{}.json",
+                        receipt["manifest"].as_str().unwrap()
+                    )))
+                    .unwrap(),
+                )
                 .unwrap(),
-            )
-            .unwrap();
+            );
             let (actual, _) = fixture.snapshot();
             for key in ["cells", "count", "excludedIncompleteRelationCount"] {
                 assert_eq!(
@@ -847,6 +857,7 @@ fn installed_version_one_state_from_previous_engine_can_be_read_and_updated() {
     )
     .unwrap();
     assert!(manifest.get("source").is_none());
+    let manifest = packed::packed_view(&state.join("output"), &manifest);
     let cells = manifest["cells"].as_object().unwrap();
     assert_eq!(cells.len(), 1);
     let digest = cells.values().next().unwrap()[0][0].as_str().unwrap();

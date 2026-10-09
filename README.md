@@ -114,9 +114,9 @@ Geofabrik 为默认来源。`config/fallback-sources.json` 保存通过准入的
 
 ## R2 打包存储
 
-Builder 保留 0.01° 查询网格和每个 POI 的原始数据，将同一 16 × 16 网格组内的小块拼成最大 1 MiB 的不可变包，上传 `packs/<SHA256>.bin` 和地区 manifest。清单记录包目录以及各小块的哈希、包编号、偏移和长度；Worker 按范围读取所需小块。本地 `blocks/` 供增量构建使用，不再逐块上传。
+Builder 保留 0.01° 查询网格和每个 POI 的原始数据，将同一 16 × 16 网格组内的小块拼成最大 1 MiB 的不可变包，上传 `packs/<SHA256>.bin`、每个网格组的索引 `indexes/<SHA256>.json` 和地区 manifest（schema 3）。索引记录本组各小块的哈希、包编号、偏移和长度；manifest 只记录网格组到索引的对照和全部包的列表，大小不再随地区面积增长，大地区无需拆分。Worker 只读取查询需要的索引，再按范围读取所需小块。本地 `blocks/` 供增量构建使用，不再逐块上传。
 
-更新只重打包发生变化的网格组；内容未变的包复用原哈希。发布结果的 `uploaded`、`reused` 统计物理对象数，包含 manifest。`--cleanup` 仍在发布确认后删除本地区本地数据，包括小块和包。
+更新只重打包发生变化的网格组；内容未变的包和索引复用原哈希。发布结果的 `uploaded`、`reused` 统计物理对象数，包含索引和 manifest。发布 schema 3 前须先部署支持它的 Worker。`--cleanup` 仍在发布确认后删除本地区本地数据，包括小块和包。
 
 构建日志输出逻辑小块数、物理包数和字节数，`release.json` 保存 `blockCount`、`packCount`、`packBytes`。比较账单时使用相同地区和更新频率；初次迁移需要上传新包，后续更新复用未变的包。打包减少对象写入次数，不改变 POI 数据量。
 
