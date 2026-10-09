@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - run: rustup default 1.95 && rustup component add clippy rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked

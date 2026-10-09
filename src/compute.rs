@@ -288,8 +288,10 @@ fn decode_objects(
                     tag_index - 1
                 };
                 let tags = dense.keys_vals[tag_start..tag_end]
-                    .chunks_exact(2)
-                    .map(|pair| (pair[0] as u32, pair[1] as u32));
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[key, value]| (*key as u32, *value as u32));
                 consume(Object::new(
                     Kind::Node,
                     add_delta(&mut id, dense.id[index])?,
