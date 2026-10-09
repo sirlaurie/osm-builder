@@ -9,6 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y osmium-tool
       - run: rustup default 1.95 && rustup component add clippy rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
