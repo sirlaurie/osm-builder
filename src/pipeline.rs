@@ -25,6 +25,7 @@ use crate::{
 };
 
 const INDEX_URL: &str = "https://download.geofabrik.de/index-v1.json";
+const FINISHED_BATCH_POLL: Duration = Duration::from_secs(300);
 
 fn disk_check(directory: &Path, minimum_gib: u64) -> Result<()> {
     let available = fs2::available_space(directory)
@@ -1933,6 +1934,14 @@ impl CloudWork<'_> {
     }
 }
 
+fn idle_poll(done: bool, retry_after_seconds: u64) -> Duration {
+    if done {
+        FINISHED_BATCH_POLL
+    } else {
+        Duration::from_secs(retry_after_seconds.clamp(1, 60))
+    }
+}
+
 fn retained_source(source: &SourceIdentity) -> &'static str {
     match source.provider {
         SourceProvider::Geofabrik => "pending-geofabrik",
@@ -2045,11 +2054,14 @@ impl WorkOperations for CloudWork<'_> {
                 prefetch: None,
                 download_control: None,
             }),
-            None => WorkClaim::Idle {
-                done: claim.pending == 0 && claim.running == 0,
-                failed: claim.failed,
-                retry: Duration::from_secs(claim.retry_after_seconds.clamp(1, 60)),
-            },
+            None => {
+                let done = claim.pending == 0 && claim.running == 0;
+                WorkClaim::Idle {
+                    done,
+                    failed: claim.failed,
+                    retry: idle_poll(done, claim.retry_after_seconds),
+                }
+            }
         })
     }
 
@@ -3238,6 +3250,14 @@ mod tests {
                 .to_string()
                 .contains("france prefetch failed")
         );
+    }
+
+    #[test]
+    fn finished_batches_are_polled_every_five_minutes_and_active_batches_every_minute() {
+        assert_eq!(idle_poll(true, 60), Duration::from_secs(300));
+        assert_eq!(idle_poll(false, 60), Duration::from_secs(60));
+        assert_eq!(idle_poll(false, 0), Duration::from_secs(1));
+        assert_eq!(idle_poll(false, 600), Duration::from_secs(60));
     }
 
     #[test]
