@@ -293,6 +293,13 @@ pub fn prepare(entry: &Region, index: &Path, output: &Path) -> Result<()> {
         updates == entry.updates_url(),
         "Catalog replication URL does not match the configured extract"
     );
+    if let Err(error) = validate_coverage(&feature["geometry"]) {
+        return Err(anyhow::Error::new(crate::network::Transient(format!(
+            "Geofabrik catalog has invalid coverage for {}: {error}",
+            entry.id
+        )))
+        .context(crate::network::SourceFailure));
+    }
     fs::create_dir_all(output)?;
     atomic_write(
         &output.join("coverage.json"),
@@ -562,6 +569,31 @@ mod tests {
             .unwrap();
             assert!(prepare(&region, &index, &output).is_err());
         }
+    }
+
+    #[test]
+    fn empty_catalog_coverage_is_a_retryable_source_failure_before_any_job_file() {
+        let work = work();
+        let index = work.path().join("index.json");
+        let output = work.path().join("job");
+        let region = Region {
+            id: "jp-chubu".into(),
+            extract: "asia/japan/chubu".into(),
+        };
+        let feature = serde_json::json!({"properties":{"urls":{"pbf":region.source_url(),"updates":region.updates_url()}},"geometry":{"type":"MultiPolygon","coordinates":[[[]]]}});
+        fs::write(
+            &index,
+            serde_json::to_vec(&serde_json::json!({"features":[feature]})).unwrap(),
+        )
+        .unwrap();
+        let error = prepare(&region, &index, &output).unwrap_err();
+        assert!(crate::network::retryable(&error), "{error:#}");
+        assert!(
+            error
+                .downcast_ref::<crate::network::SourceFailure>()
+                .is_some()
+        );
+        assert!(!output.join("coverage.json").exists());
     }
 
     #[test]

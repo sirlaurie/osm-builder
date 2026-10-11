@@ -2277,7 +2277,8 @@ impl WorkOperations for CloudWork<'_> {
                 operations.update(&entry, &candidates)
             }
             other => other,
-        }?;
+        }
+        .map_err(crate::network::source_failure)?;
         // ponytail: approved failover regions defer peer prefetch until compute finishes; add preemption only if throughput requires it.
         flow.sources_ready.lock().expect("source readiness lock")[slot] = true;
         flow.changed.notify_all();

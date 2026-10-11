@@ -374,6 +374,9 @@ impl Client {
         if let Some(network::RetryAfter(delay)) = error.downcast_ref::<network::RetryAfter>() {
             body["retryAfterSeconds"] = json!(delay.min(&network::MAX_RETRY_DELAY).as_secs());
         }
+        if error.downcast_ref::<network::SourceFailure>().is_some() {
+            body["source"] = json!(true);
+        }
         let value = self.request(Method::POST, "/admin/jobs/release", Some(&body))?;
         ensure!(
             value["success"] == true,

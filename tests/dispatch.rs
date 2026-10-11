@@ -317,6 +317,30 @@ fn renewal_preserves_fencing_and_release_retries_the_same_lease() {
 }
 
 #[test]
+fn source_failures_are_marked_in_the_release_and_other_failures_are_not() {
+    let server = Server::new(|_, _| Reply::json(json!({ "success": true })));
+    let client = server.client(1);
+    let outage = anyhow::Error::new(network::Transient("HTTP 404".into()));
+    client
+        .release(
+            &lease(),
+            ReleaseOutcome::Retry,
+            &network::source_failure(outage),
+        )
+        .unwrap();
+    client
+        .release(
+            &lease(),
+            ReleaseOutcome::Retry,
+            &anyhow::Error::new(network::Transient("R2 request failed: HTTP 503".into())),
+        )
+        .unwrap();
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests[0].1["source"], true);
+    assert!(requests[1].1.get("source").is_none());
+}
+
+#[test]
 fn release_reasons_are_bounded_for_the_coordinator_body_limit() {
     let server = Server::new(|_, _| Reply::json(json!({ "success": true })));
     let reason = anyhow::anyhow!("\u{0}".repeat(4096));

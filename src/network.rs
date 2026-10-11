@@ -103,6 +103,23 @@ pub fn retryable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Transient>().is_some()
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct SourceFailure;
+
+impl fmt::Display for SourceFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Regional data source failed")
+    }
+}
+
+pub fn source_failure(error: anyhow::Error) -> anyhow::Error {
+    if retryable(&error) && error.downcast_ref::<SourceFailure>().is_none() {
+        error.context(SourceFailure)
+    } else {
+        error
+    }
+}
+
 pub fn summary(error: &anyhow::Error, message: String) -> anyhow::Error {
     let summary = if retryable(error) {
         Transient(message).into()
