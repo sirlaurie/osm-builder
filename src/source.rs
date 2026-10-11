@@ -262,8 +262,8 @@ pub fn regions(path: &Path) -> Result<Vec<Region>> {
     Ok(config.regions)
 }
 
-pub fn prepare(entry: &Region, index: &Path, output: &Path) -> Result<()> {
-    let catalog: Value = serde_json::from_slice(&fs::read(index)?)?;
+fn catalog_entry(entry: &Region, bytes: &[u8]) -> Result<(Value, String)> {
+    let catalog: Value = serde_json::from_slice(bytes)?;
     let features = catalog["features"]
         .as_array()
         .context("Invalid Geofabrik catalog")?;
@@ -293,13 +293,19 @@ pub fn prepare(entry: &Region, index: &Path, output: &Path) -> Result<()> {
         updates == entry.updates_url(),
         "Catalog replication URL does not match the configured extract"
     );
-    if let Err(error) = validate_coverage(&feature["geometry"]) {
-        return Err(anyhow::Error::new(crate::network::Transient(format!(
-            "Geofabrik catalog has invalid coverage for {}: {error}",
+    validate_coverage(&feature["geometry"])?;
+    Ok((feature.clone(), updates))
+}
+
+pub fn prepare(entry: &Region, index: &Path, output: &Path) -> Result<()> {
+    let url = entry.source_url();
+    let (feature, updates) = catalog_entry(entry, &fs::read(index)?).map_err(|error| {
+        anyhow::Error::new(crate::network::Transient(format!(
+            "Geofabrik catalog entry for {} is invalid: {error:#}",
             entry.id
         )))
-        .context(crate::network::SourceFailure));
-    }
+        .context(crate::network::SourceFailure)
+    })?;
     fs::create_dir_all(output)?;
     atomic_write(
         &output.join("coverage.json"),
@@ -381,6 +387,12 @@ pub fn replication_url(value: &str) -> Result<String> {
 }
 
 pub fn replication_state(value: &str) -> Result<ReplicationState> {
+    parse_replication_state(value).map_err(|error| {
+        crate::network::Transient(format!("Invalid replication state: {error:#}")).into()
+    })
+}
+
+fn parse_replication_state(value: &str) -> Result<ReplicationState> {
     let mut fields = std::collections::HashMap::new();
     for line in value
         .lines()
@@ -648,13 +660,15 @@ mod tests {
         assert_eq!(state.sequence, 42);
         assert_eq!(state.timestamp, "2025-01-02T01:04:05Z");
         for invalid in [
+            "",
             "sequenceNumber=1\nsequenceNumber=2\ntimestamp=2025-01-01T00:00:00Z",
             "sequenceNumber=-1\ntimestamp=2025-01-01T00:00:00Z",
             "sequenceNumber=9007199254740992\ntimestamp=2025-01-01T00:00:00Z",
             "sequenceNumber=1\ntimestamp=2025-01-01T00:00:00",
             "sequenceNumber=1\ntimestamp=2999-01-01T00:00:00Z",
         ] {
-            assert!(replication_state(invalid).is_err());
+            let error = replication_state(invalid).unwrap_err();
+            assert!(crate::network::retryable(&error), "{invalid:?}");
         }
     }
 

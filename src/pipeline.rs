@@ -393,7 +393,8 @@ impl Downloader {
         };
         let path = work.join("state.txt");
         self.download(runtime, &format!("{url}/{suffix}.txt"), &path, Some(16_384))?;
-        let state = source::replication_state(&fs::read_to_string(path)?)?;
+        let state = source::replication_state(&String::from_utf8_lossy(&fs::read(path)?))
+            .with_context(|| format!("{url}/{suffix}.txt"))?;
         ensure!(
             sequence.is_none_or(|sequence| sequence == state.sequence),
             crate::network::Transient(format!(
@@ -475,7 +476,12 @@ impl Downloader {
                 };
                 match stamp {
                     Ok(()) => return Ok(()),
-                    Err(error) if attempt >= runtime.download_retries => return Err(error),
+                    Err(error) if attempt >= runtime.download_retries => {
+                        return Err(crate::network::Transient(format!(
+                            "Source snapshot is invalid: {error:#}"
+                        ))
+                        .into());
+                    }
                     Err(_) => {}
                 }
             }
@@ -3220,7 +3226,7 @@ mod tests {
     #[test]
     fn prefetch_failure_stops_other_slots_before_the_source_is_consumed() {
         let work = work();
-        fs::write(work.path().join("missing-catalog.json"), b"{}").unwrap();
+        fs::write(work.path().join(".downloads"), b"").unwrap();
         let flow = Arc::new(PipelineFlow::new(true));
         let failed = flow.control(0);
         let other = flow.control(1);
@@ -3228,7 +3234,7 @@ mod tests {
         let prefetch = Prefetch::controlled(
             &runtime(),
             &entry("france"),
-            &work.path().join("missing-catalog.json"),
+            &work.path().join("unused-catalog"),
             work.path(),
             Arc::clone(&failed),
             false,
@@ -3715,7 +3721,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_invalid_remote_data_after_the_inner_limit() {
+    fn invalid_remote_snapshot_is_a_retryable_failure_after_the_inner_limit() {
         let data = work();
         let entry = entry("france");
         let identity = SourceIdentity::from_replication_url(&entry.updates_url()).unwrap();
@@ -3735,7 +3741,7 @@ mod tests {
                 }
                 Ok(())
             });
-        assert!(!crate::network::retryable(&result.unwrap_err()));
+        assert!(crate::network::retryable(&result.unwrap_err()));
         assert_eq!(pbf_downloads, 2);
     }
 
