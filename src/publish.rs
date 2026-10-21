@@ -1380,7 +1380,7 @@ mod tests {
     fn listing_pages_report_keys_sizes_times_and_truncation() {
         let page = br#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Name>aura-osm-data</Name><Prefix>packs/</Prefix><KeyCount>2</KeyCount>
+  <Name>path-osm-data</Name><Prefix>packs/</Prefix><KeyCount>2</KeyCount>
   <MaxKeys>1000</MaxKeys><IsTruncated>true</IsTruncated>
   <Contents><Key>packs/a.bin</Key><Size>42</Size>
     <LastModified>2026-09-13T05:49:12.000Z</LastModified><ETag>&quot;x&quot;</ETag></Contents>

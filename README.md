@@ -22,7 +22,7 @@ cargo build --release
 
 ```dotenv
 R2_ACCOUNT_ID="<Cloudflare 账户 ID>"
-R2_BUCKET="aura-osm-data"
+R2_BUCKET="path-osm-data"
 AWS_ACCESS_KEY_ID="<R2 Access Key ID>"
 AWS_SECRET_ACCESS_KEY="<R2 Secret Access Key>"
 OSM_WORKER_URL="https://aura-osm-data.<你的子域>.workers.dev"
