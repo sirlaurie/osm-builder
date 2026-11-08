@@ -61,15 +61,33 @@ pub fn worker_plist_definition(root: &Path, cleanup: bool) -> Result<Value> {
     Ok(Value::Dictionary(definition))
 }
 
-fn systemd_quote(value: &str) -> Result<String> {
+fn systemd_working_directory(value: &str) -> Result<String> {
     ensure!(
         !value
             .bytes()
             .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r')),
         "Systemd paths must not contain control characters"
     );
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    Ok(format!("\"{escaped}\""))
+    Ok(value.replace('%', "%%"))
+}
+
+fn systemd_arg(value: &str) -> Result<String> {
+    ensure!(
+        !value
+            .bytes()
+            .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r')),
+        "Systemd paths must not contain control characters"
+    );
+    let specifier_safe = value.replace('%', "%%");
+    if specifier_safe
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '\\'))
+    {
+        let escaped = specifier_safe.replace('\\', "\\\\").replace('"', "\\\"");
+        Ok(format!("\"{escaped}\""))
+    } else {
+        Ok(specifier_safe)
+    }
 }
 
 pub fn worker_systemd_unit(root: &Path, executable: &Path, cleanup: bool) -> Result<String> {
@@ -81,8 +99,8 @@ pub fn worker_systemd_unit(root: &Path, executable: &Path, cleanup: bool) -> Res
         .context("Service paths must be valid UTF-8")?;
     let mut command = format!(
         "{} --root {} work",
-        systemd_quote(exe_text)?,
-        systemd_quote(root_text)?
+        systemd_arg(exe_text)?,
+        systemd_arg(root_text)?
     );
     if cleanup {
         command.push_str(" --cleanup");
@@ -105,7 +123,7 @@ pub fn worker_systemd_unit(root: &Path, executable: &Path, cleanup: bool) -> Res
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        systemd_quote(root_text)?
+        systemd_working_directory(root_text)?
     ))
 }
 
@@ -526,6 +544,11 @@ mod tests {
 
         let exe = std::env::current_exe().unwrap();
         let unit = worker_systemd_unit(root, &exe, true).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        assert!(unit.contains(&format!(
+            "WorkingDirectory={}\n",
+            canonical_root.to_str().unwrap()
+        )));
         assert!(unit.contains("Restart=always\n"));
         assert!(unit.contains("RestartSec=10\n"));
         assert!(unit.contains("TimeoutStopSec=3600\n"));

@@ -125,6 +125,10 @@ fn cli_loads_project_through_directory_symlinks_and_holds_an_os_lock() {
         String::from_utf8_lossy(&unit_scheduled.stderr)
     );
     let unit_text = fs::read_to_string(&worker_unit).unwrap();
+    assert!(unit_text.contains(&format!(
+        "WorkingDirectory={}\n",
+        project.canonicalize().unwrap().to_str().unwrap()
+    )));
     assert!(unit_text.contains("Restart=always\n"));
     assert!(unit_text.contains("TimeoutStopSec=3600\n"));
     assert!(unit_text.contains(" work --cleanup\n"));
