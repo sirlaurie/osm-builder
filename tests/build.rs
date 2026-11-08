@@ -94,6 +94,7 @@ fn unordered_nested_geometry_and_multilingual_names() {
       <node id="1" lat="-34" lon="150"><tag k="name:zh" v="咖啡"/><tag k="amenity" v="cafe"/></node>
       <node id="2" lat="-33" lon="151"/><node id="3" lat="-32" lon="152"/>
       <node id="4" lat="-33" lon="151"><tag k="amenity" v="parking"/></node>
+      <way id="69"><nd ref="99"/><tag k="highway" v="residential"/></way>
       <relation id="70"/><relation id="71"><member type="relation" ref="72"/></relation>
       <relation id="72"><member type="relation" ref="71"/></relation></osm>"#, 4).unwrap();
     assert_eq!(manifest["sourceSequence"], 5);
@@ -172,7 +173,9 @@ fn incomplete_relations_preserve_terminal_diagnostics_and_parent_exclusion() {
 fn broken_way_cycle_or_empty_geometry_cannot_publish_or_hide_in_partial_relation() {
     let work = common::work("build-errors-");
     let inputs = [
-        r#"<way id="1"><nd ref="99"/></way>"#,
+        r#"<way id="1"><nd ref="99"/><tag k="name" v="Broken Cafe"/><tag k="amenity" v="cafe"/></way>"#,
+        r#"<way id="10"><nd ref="99"/></way><relation id="1"><member type="way" ref="10"/><tag k="name" v="Park"/><tag k="leisure" v="park"/></relation>"#,
+        r#"<way id="10"><nd ref="99"/></way><relation id="1"><member type="way" ref="10"/><member type="way" ref="99"/><tag k="name" v="Park"/><tag k="leisure" v="park"/></relation>"#,
         r#"<relation id="1"><tag k="name" v="Park"/><tag k="leisure" v="park"/></relation>"#,
         r#"<relation id="1"><member type="relation" ref="1"/><tag k="name" v="Park"/><tag k="leisure" v="park"/></relation>"#,
         r#"<relation id="1"><member type="relation" ref="2"/><tag k="name" v="Park"/><tag k="leisure" v="park"/></relation><relation id="2"><member type="relation" ref="1"/></relation>"#,

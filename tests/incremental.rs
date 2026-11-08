@@ -594,6 +594,22 @@ fn invalid_geometry_and_object_write_failure_roll_back_the_database() {
     fs::rename(moved, manifests).unwrap();
     assert_eq!(fixture.status()["sequence"], 10);
     assert_eq!(fixture.snapshot(), before);
+    fixture
+        .change(
+            r#"<create><way id="999" version="1"><nd ref="9999"/><tag k="highway" v="residential"/></way></create>"#,
+            11,
+        )
+        .unwrap();
+    let after_unselected = fixture.snapshot();
+    assert_eq!(after_unselected.1, before.1);
+    for body in [
+        r#"<modify><way id="999" version="2"><nd ref="9999"/><tag k="name" v="Broken Cafe"/><tag k="amenity" v="cafe"/></way></modify>"#,
+        r#"<modify><relation id="20" version="2"><member type="way" ref="999"/><tag k="name" v="Museum"/><tag k="tourism" v="museum"/></relation></modify>"#,
+    ] {
+        assert!(fixture.change(body, 12).is_err());
+        assert_eq!(fixture.status()["sequence"], 11);
+        assert_eq!(fixture.snapshot(), after_unselected);
+    }
 }
 
 #[test]

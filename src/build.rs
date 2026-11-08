@@ -218,21 +218,6 @@ fn classify_relations(connection: &Connection) -> Result<()> {
     connection
         .execute_batch("CREATE INDEX refs_target ON refs(target_kind, target_id, kind, id);")?;
     progress.finish_timing();
-    let progress = Progress::new("Way node reference check");
-    let missing: Option<(i64, i64)> = connection
-        .query_row(
-            "SELECT refs.id, refs.target_id FROM refs INDEXED BY refs_target
-         LEFT JOIN objects ON objects.kind='node' AND objects.id=refs.target_id
-         WHERE refs.kind='way' AND objects.id IS NULL
-         ORDER BY refs.target_kind, refs.target_id LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((way, node)) = missing {
-        bail!("Missing reference node/{node} in way/{way}");
-    }
-    progress.finish_timing();
     let mut progress = Progress::new("Incomplete relation propagation");
     connection.execute_batch(
         "CREATE TABLE incomplete_relations (id INTEGER PRIMARY KEY);
@@ -335,6 +320,21 @@ pub(crate) fn prepare_geometry(connection: &Connection) -> Result<()> {
     ).optional()?;
     if let Some((kind, id)) = empty {
         bail!("No geometry for {kind}/{id}");
+    }
+    let missing: Option<(i64, i64)> = connection
+        .query_row(
+            "SELECT needed.id,refs.target_id FROM needed
+             LEFT JOIN bounds ON bounds.kind='way' AND bounds.id=needed.id
+             CROSS JOIN refs ON refs.kind='way' AND refs.id=needed.id
+             LEFT JOIN objects ON objects.kind='node' AND objects.id=refs.target_id
+             WHERE needed.kind='way' AND bounds.id IS NULL AND objects.id IS NULL
+             ORDER BY needed.id,refs.target_id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((way, node)) = missing {
+        bail!("Missing reference node/{node} in way/{way}");
     }
     connection.execute_batch(
         "INSERT INTO bounds(kind,id,west,south,east,north)

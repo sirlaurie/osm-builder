@@ -335,23 +335,8 @@ fn apply_objects(connection: &Connection) -> Result<()> {
     add_affected_parents(connection)?;
     connection.execute_batch(
         "DELETE FROM bounds WHERE (kind,id) IN (SELECT kind,id FROM affected);
-         DELETE FROM validated_geometry WHERE (kind,id) IN (SELECT kind,id FROM affected);",
-    )?;
-    let missing: Option<(i64, i64)> = connection
-        .query_row(
-            "SELECT refs.id,refs.target_id FROM affected
-         CROSS JOIN refs ON refs.kind='way' AND refs.id=affected.id
-         LEFT JOIN objects ON objects.kind='node' AND objects.id=refs.target_id
-         WHERE affected.kind='way' AND objects.id IS NULL LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((way, node)) = missing {
-        bail!("Missing reference node/{node} in way/{way}");
-    }
-    connection.execute_batch(
-        "DELETE FROM incomplete_relations WHERE id IN (SELECT id FROM affected WHERE kind='relation');
+         DELETE FROM validated_geometry WHERE (kind,id) IN (SELECT kind,id FROM affected);
+         DELETE FROM incomplete_relations WHERE id IN (SELECT id FROM affected WHERE kind='relation');
          WITH RECURSIVE incomplete(id) AS (
             SELECT refs.id FROM affected
             CROSS JOIN refs ON refs.kind='relation' AND refs.id=affected.id

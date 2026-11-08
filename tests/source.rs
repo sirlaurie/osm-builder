@@ -342,3 +342,28 @@ fn fallback_admission_rejects_unmatched_regions_unsafe_paths_and_invalid_coverag
     .unwrap();
     assert!(source::fallback_sources(&path, &regions).is_err());
 }
+
+#[test]
+fn configured_fallback_sources_match_configured_regions_and_prepare_valid_candidates() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let regions = source::regions(&root.join("config/regions.json")).unwrap();
+    let fallbacks =
+        source::fallback_sources(&root.join("config/fallback-sources.json"), &regions).unwrap();
+    assert!(!fallbacks.is_empty());
+    let work = common::work("source-configured-fallbacks-");
+    for entry in &fallbacks {
+        let region = regions
+            .iter()
+            .find(|region| region.id == entry.region)
+            .unwrap();
+        let matched = source::fallback_for(&fallbacks, region).unwrap();
+        assert_eq!(matched.region, entry.region);
+        assert_eq!(matched.geofabrik_extract, entry.geofabrik_extract);
+        assert_eq!(matched.osm_france_extract, entry.osm_france_extract);
+        let output = work.path().join(&entry.region);
+        source::prepare_fallback(entry, &output).unwrap();
+        assert!(output.join("coverage.json").is_file());
+        assert!(output.join("source.url").is_file());
+        assert!(output.join("updates.url").is_file());
+    }
+}
