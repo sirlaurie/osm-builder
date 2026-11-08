@@ -37,6 +37,8 @@ OSM_PUBLISH_TOKEN="<OSM Worker 的 PUBLISH_TOKEN>"
 | --- | --- |
 | 查看可用地区 | `osm list` |
 | 处理任务（每台处理设备） | `osm work --cleanup` |
+| 安装或重启后台驻留服务（macOS / Linux） | `osm service --cleanup` |
+| 远程更新全部处理设备 | `osm deploy` |
 | 提交首次构建 | `osm bootstrap all --submit-only` |
 | 提交更新 | `osm update all --submit-only` |
 | 查看任务进度和失败原因 | `osm jobs` |
@@ -50,6 +52,25 @@ OSM_PUBLISH_TOKEN="<OSM Worker 的 PUBLISH_TOKEN>"
 `bootstrap` 和 `update` 接受一个或多个地区名。`all` 表示 `config/regions.json` 中的全部地区。
 
 所有处理设备共用仓库、OSM Worker 和 R2 存储桶。`.device-id` 文件属于单台设备，禁止复制。
+
+## 后台服务与远程发布
+
+1. 首次初始化：
+   - Debian 开启用户级后台常驻：`loginctl enable-linger "$USER"`。
+   - Mac mini 和 Debian 在各自仓库目录执行：`cargo build --release && .build/tools/rust/release/osm service --cleanup`（该命令同时将本机仓库路径写入 `~/.config/aura-osm/root`）。
+2. 开发机 `osm-builder/.env` 配置目标机器（支持 `host:path` 指定不同路径，或填 `host` 读取远端 `~/.config/aura-osm/root`）：
+
+```dotenv
+OSM_WORKER_HOSTS="mac-mini:/Users/<user>/Aura/osm-builder,debian:/home/<user>/Aura/osm-builder"
+```
+
+3. 日常代码发布（开发机 `git push` 后执行）：
+
+```sh
+osm deploy
+```
+
+`osm deploy` 登录各台机器拉取代码、编译并执行 `osm service --cleanup`。`osm service --cleanup` 向旧进程发送 `SIGTERM`。空闲线程立即退出；运行中的任务完成当前地区的处理、上传与清理后退出（最长等待 3600 秒），然后启动新进程。
 
 ## 每月更新
 

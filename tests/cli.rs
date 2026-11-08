@@ -86,6 +86,48 @@ fn cli_loads_project_through_directory_symlinks_and_holds_an_os_lock() {
     );
     assert_eq!(arguments[3].as_string(), Some("update"));
     assert_eq!(arguments[4].as_string(), Some("all"));
+    let worker_plist = work.path().join("worker.plist");
+    let worker_scheduled = invoke(
+        &linked,
+        &[
+            "service",
+            "--cleanup",
+            "--output",
+            worker_plist.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        worker_scheduled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&worker_scheduled.stderr)
+    );
+    let worker_def = plist::Value::from_file(&worker_plist).unwrap();
+    let worker_def = worker_def.as_dictionary().unwrap();
+    assert_eq!(worker_def["KeepAlive"].as_boolean(), Some(true));
+    assert_eq!(worker_def["ExitTimeOut"].as_unsigned_integer(), Some(3600));
+    let worker_args = worker_def["ProgramArguments"].as_array().unwrap();
+    assert_eq!(worker_args[3].as_string(), Some("work"));
+    assert_eq!(worker_args[4].as_string(), Some("--cleanup"));
+
+    let worker_unit = work.path().join("osm-worker.service");
+    let unit_scheduled = invoke(
+        &linked,
+        &[
+            "service",
+            "--cleanup",
+            "--output",
+            worker_unit.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        unit_scheduled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unit_scheduled.stderr)
+    );
+    let unit_text = fs::read_to_string(&worker_unit).unwrap();
+    assert!(unit_text.contains("Restart=always\n"));
+    assert!(unit_text.contains("TimeoutStopSec=3600\n"));
+    assert!(unit_text.contains(" work --cleanup\n"));
     let lock = OpenOptions::new()
         .read(true)
         .write(true)

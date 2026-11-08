@@ -115,6 +115,21 @@ enum Action {
         #[arg(long, help = "Write a plist for inspection without installing it")]
         output: Option<PathBuf>,
     },
+    #[command(about = "Install or restart the persistent regional worker service on this machine")]
+    Service {
+        #[arg(long, help = "Remove local region data after confirmed publication")]
+        cleanup: bool,
+        #[arg(
+            long,
+            help = "Write the service definition (.plist or .service) without installing it"
+        )]
+        output: Option<PathBuf>,
+    },
+    #[command(about = "Pull, build and restart the worker service across remote machines over SSH")]
+    Deploy {
+        #[arg(help = "Remote targets (host or host:path); defaults to OSM_WORKER_HOSTS in .env")]
+        targets: Vec<String>,
+    },
     #[command(about = "Compile a local PBF snapshot without network access")]
     Compile {
         #[command(flatten)]
@@ -233,6 +248,8 @@ fn run(cli: Cli) -> Result<()> {
         | Action::Jobs
         | Action::PublishedState
         | Action::Schedule { .. }
+        | Action::Service { .. }
+        | Action::Deploy { .. }
         | Action::Cancel
         | Action::Retire { .. }
         | Action::Gc { .. } => None,
@@ -400,6 +417,15 @@ fn run(cli: Cli) -> Result<()> {
         Action::Schedule { output } => {
             let path = schedule::run(&root, &runtime, &environment, output.as_deref())?;
             println!("Monthly schedule: {}", path.display());
+        }
+        Action::Service { cleanup, output } => {
+            let path = schedule::install_worker(&root, &environment, cleanup, output.as_deref())?;
+            println!("Worker service: {}", path.display());
+        }
+        Action::Deploy { targets } => {
+            for target in schedule::deploy_workers(&targets, &environment, true)? {
+                println!("Deployed worker: {}", target.host);
+            }
         }
         Action::Compile { source, output } => {
             let receipt = build::run(

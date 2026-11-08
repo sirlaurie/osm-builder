@@ -1492,6 +1492,7 @@ impl std::error::Error for Yielded {}
 
 struct PipelineFlow {
     cancelled: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
     phases: Mutex<[WorkPhase; 2]>,
     sources_ready: Mutex<[bool; 2]>,
     changed: Condvar,
@@ -1509,9 +1510,15 @@ struct PipelineFlow {
 }
 
 impl PipelineFlow {
+    #[cfg(test)]
     fn new(cleanup: bool) -> Self {
+        Self::with_stopping(cleanup, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn with_stopping(cleanup: bool, stopping: Arc<AtomicBool>) -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            stopping,
             phases: Mutex::new([WorkPhase::Idle; 2]),
             sources_ready: Mutex::new([false; 2]),
             changed: Condvar::new(),
@@ -1527,6 +1534,15 @@ impl PipelineFlow {
             failure: Mutex::new(None),
             cleanup,
         }
+    }
+
+    fn drain(&self) {
+        self.stopping.store(true, Ordering::Release);
+        let _phases = self
+            .phases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.changed.notify_all();
     }
 
     fn check(&self) -> Result<()> {
@@ -1615,7 +1631,7 @@ impl PipelineFlow {
     fn pause(&self, duration: Duration) {
         let deadline = std::time::Instant::now() + duration;
         let mut phases = self.phases.lock().expect("pipeline phases lock");
-        while !self.cancelled.load(Ordering::Acquire) {
+        while !self.cancelled.load(Ordering::Acquire) && !self.stopping.load(Ordering::Acquire) {
             let Some(remaining) = deadline
                 .checked_duration_since(std::time::Instant::now())
                 .filter(|remaining| !remaining.is_zero())
@@ -1734,6 +1750,7 @@ trait WorkOperations: Sync {
     }
 }
 
+#[cfg(test)]
 fn execute_work(
     operations: &impl WorkOperations,
     once: bool,
@@ -1741,7 +1758,74 @@ fn execute_work(
     retry_delay: Duration,
     contacted: &AtomicBool,
 ) -> Result<()> {
-    let flow = Arc::new(PipelineFlow::new(cleanup));
+    execute_work_with_stopping(
+        operations,
+        once,
+        cleanup,
+        retry_delay,
+        contacted,
+        Arc::new(AtomicBool::new(false)),
+        |_| None,
+    )
+}
+
+struct ShutdownListener(Option<Arc<tokio::sync::Notify>>);
+
+impl Drop for ShutdownListener {
+    fn drop(&mut self) {
+        if let Some(notify) = self.0.take() {
+            notify.notify_one();
+        }
+    }
+}
+
+fn spawn_shutdown_listener(flow: &Arc<PipelineFlow>) -> Option<ShutdownListener> {
+    let stop_listener = Arc::new(tokio::sync::Notify::new());
+    let listener_stop = Arc::clone(&stop_listener);
+    let flow = Arc::clone(flow);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    std::thread::Builder::new()
+        .name("osm-signal".into())
+        .spawn(move || {
+            runtime.block_on(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+                    return;
+                };
+                let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
+                    return;
+                };
+                tokio::select! {
+                    _ = terminate.recv() => {
+                        progress::message("Received SIGTERM; finishing active regional tasks before exit");
+                        flow.drain();
+                    }
+                    _ = interrupt.recv() => {
+                        progress::message("Received SIGINT; finishing active regional tasks before exit");
+                        flow.drain();
+                    }
+                    _ = listener_stop.notified() => {}
+                }
+            });
+        })
+        .ok()?;
+    Some(ShutdownListener(Some(stop_listener)))
+}
+
+fn execute_work_with_stopping(
+    operations: &impl WorkOperations,
+    once: bool,
+    cleanup: bool,
+    retry_delay: Duration,
+    contacted: &AtomicBool,
+    stopping: Arc<AtomicBool>,
+    listener: impl FnOnce(&Arc<PipelineFlow>) -> Option<ShutdownListener>,
+) -> Result<()> {
+    let flow = Arc::new(PipelineFlow::with_stopping(cleanup, stopping));
+    let _listener = listener(&flow);
     std::thread::scope(|scope| {
         let mut workers = Vec::new();
         for slot in 0..2 {
@@ -1751,7 +1835,7 @@ fn execute_work(
                 loop {
                     let (claim, ticket) = {
                         let _claim = flow.claims.lock().expect("claim lock");
-                        if flow.check().is_err() {
+                        if flow.check().is_err() || flow.stopping.load(Ordering::Acquire) {
                             return Ok(());
                         }
                         match operations.claim(slot as u8) {
@@ -1772,6 +1856,9 @@ fn execute_work(
                     let mut task = match claim {
                         WorkClaim::Task(task) => task,
                         WorkClaim::Idle { done, failed, retry } => {
+                            if flow.stopping.load(Ordering::Acquire) {
+                                return Ok(());
+                            }
                             if once && done {
                                 if failed != 0 {
                                     flow.stop();
@@ -1835,6 +1922,9 @@ fn execute_work(
                             }
                             drop(task);
                             flow.idle(slot);
+                            if flow.stopping.load(Ordering::Acquire) {
+                                return Ok(());
+                            }
                             let delay = crate::network::retry_delay(&error, retry_delay, flow.retry_streak.fetch_add(1, Ordering::AcqRel));
                             progress::message(&format!("Region {region} returned for retry: {error:#}; next claim in {}s", delay.as_secs()));
                             flow.pause(delay);
@@ -1879,6 +1969,7 @@ fn execute_work(
     })
 }
 
+#[cfg(test)]
 fn wait_for_work(
     operations: &impl WorkOperations,
     once: bool,
@@ -1886,11 +1977,45 @@ fn wait_for_work(
     retry_delay: Duration,
     mut sleep: impl FnMut(Duration),
 ) -> Result<()> {
+    wait_for_work_with_stopping(
+        operations,
+        once,
+        cleanup,
+        retry_delay,
+        Arc::new(AtomicBool::new(false)),
+        |_, duration| sleep(duration),
+        |_| None,
+    )
+}
+
+fn wait_for_work_with_stopping(
+    operations: &impl WorkOperations,
+    once: bool,
+    cleanup: bool,
+    retry_delay: Duration,
+    stopping: Arc<AtomicBool>,
+    mut sleep: impl FnMut(&AtomicBool, Duration),
+    mut listener: impl FnMut(&Arc<PipelineFlow>) -> Option<ShutdownListener>,
+) -> Result<()> {
     let contacted = AtomicBool::new(false);
     let mut attempt = 0_u32;
     loop {
-        match execute_work(operations, once, cleanup, retry_delay, &contacted) {
+        if stopping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match execute_work_with_stopping(
+            operations,
+            once,
+            cleanup,
+            retry_delay,
+            &contacted,
+            Arc::clone(&stopping),
+            &mut listener,
+        ) {
             Err(error) if crate::network::retryable(&error) => {
+                if stopping.load(Ordering::Acquire) {
+                    return Ok(());
+                }
                 if contacted.swap(false, Ordering::AcqRel) {
                     attempt = 0;
                 }
@@ -1899,7 +2024,7 @@ fn wait_for_work(
                     "Network unavailable: {error:#}; retrying work in {}s",
                     delay.as_secs()
                 ));
-                sleep(delay);
+                sleep(&stopping, delay);
                 attempt = attempt.saturating_add(1);
             }
             result => return result,
@@ -2378,7 +2503,7 @@ pub fn work(
     fs::create_dir_all(&scratch)?;
     sweep_interrupted(data, &scratch)?;
     println!("Device {device}: waiting for regional tasks");
-    wait_for_work(
+    wait_for_work_with_stopping(
         &CloudWork {
             runtime,
             environment,
@@ -2395,7 +2520,20 @@ pub fn work(
         once,
         cleanup,
         Duration::from_secs(60),
-        thread::sleep,
+        Arc::new(AtomicBool::new(false)),
+        |stopping, duration| {
+            let deadline = std::time::Instant::now() + duration;
+            while !stopping.load(Ordering::Acquire) {
+                let Some(remaining) = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                else {
+                    break;
+                };
+                thread::sleep(remaining.min(Duration::from_millis(100)));
+            }
+        },
+        spawn_shutdown_listener,
     )
 }
 
@@ -2726,7 +2864,9 @@ mod tests {
                 match self.case {
                     ScheduleCase::Overlap => {
                         self.wait_for("upload:a");
-                        self.wait_for("prepare:c");
+                        if !flow.stopping.load(Ordering::Acquire) {
+                            self.wait_for("prepare:c");
+                        }
                     }
                     ScheduleCase::LowDisk => self.wait_for("cleanup:a"),
                     ScheduleCase::UploadFailure => {
@@ -4876,5 +5016,65 @@ mod tests {
         assert!(flow.check().is_ok());
         assert!(!flow.sources_ready.lock().unwrap()[0]);
         assert!(!control.failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn graceful_drain_finishes_claimed_work_and_wakes_idle_slots_without_claiming_more() {
+        let operations = ScheduleOperations::new(ScheduleCase::Overlap);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop_handle = Arc::clone(&stopping);
+        std::thread::scope(|scope| {
+            let ops = &operations;
+            execute_work_with_stopping(
+                ops,
+                false,
+                true,
+                Duration::from_secs(60),
+                &AtomicBool::new(false),
+                stopping,
+                |flow| {
+                    let flow = Arc::clone(flow);
+                    scope.spawn(move || {
+                        ops.wait_for("claim:b");
+                        stop_handle.store(true, Ordering::Release);
+                        flow.drain();
+                    });
+                    None
+                },
+            )
+            .unwrap();
+        });
+        let state = operations.state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert_eq!(state.next, 2);
+        assert!(state.events.contains(&"cleanup:a".into()));
+        assert!(state.events.contains(&"cleanup:b".into()));
+        assert!(!state.events.contains(&"claim:c".into()));
+    }
+
+    #[test]
+    fn graceful_drain_stops_idle_daemon_immediately() {
+        let operations = ScheduleOperations::new(ScheduleCase::Overlap);
+        operations.state.lock().unwrap().next = 3;
+        let stopping = Arc::new(AtomicBool::new(false));
+        let started = std::time::Instant::now();
+        execute_work_with_stopping(
+            &operations,
+            false,
+            true,
+            Duration::from_secs(60),
+            &AtomicBool::new(false),
+            stopping,
+            |flow| {
+                let flow = Arc::clone(flow);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    flow.drain();
+                });
+                None
+            },
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
