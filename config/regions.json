@@ -13,6 +13,7 @@
     {"id":"au-tasmania","extract":"australia-oceania/australia/tasmania"},
     {"id":"au-victoria","extract":"australia-oceania/australia/victoria"},
     {"id":"au-western-australia","extract":"australia-oceania/australia/western-australia"},
+    {"id":"az","extract":"asia/azerbaijan"},
     {"id":"br-centro-oeste","extract":"south-america/brazil/centro-oeste"},
     {"id":"br-nordeste","extract":"south-america/brazil/nordeste"},
     {"id":"br-norte","extract":"south-america/brazil/norte"},
@@ -171,6 +172,7 @@
     {"id":"in-northern-zone","extract":"asia/india/northern-zone"},
     {"id":"in-southern-zone","extract":"asia/india/southern-zone"},
     {"id":"in-western-zone","extract":"asia/india/western-zone"},
+    {"id":"iq","extract":"asia/iraq"},
     {"id":"jp-chubu","extract":"asia/japan/chubu"},
     {"id":"jp-chugoku","extract":"asia/japan/chugoku"},
     {"id":"jp-hokkaido","extract":"asia/japan/hokkaido"},
@@ -183,6 +185,7 @@
     {"id":"lk","extract":"asia/sri-lanka"},
     {"id":"mx","extract":"north-america/mexico"},
     {"id":"my-sg-bn","extract":"asia/malaysia-singapore-brunei"},
+    {"id":"nz","extract":"australia-oceania/new-zealand"},
     {"id":"th","extract":"asia/thailand"},
     {"id":"tw","extract":"asia/taiwan"},
     {"id":"us-alabama","extract":"north-america/us/alabama"},
@@ -238,6 +241,7 @@
     {"id":"us-west-virginia","extract":"north-america/us/west-virginia"},
     {"id":"us-wisconsin","extract":"north-america/us/wisconsin"},
     {"id":"us-wyoming","extract":"north-america/us/wyoming"},
+    {"id":"uz","extract":"asia/uzbekistan"},
     {"id":"vn","extract":"asia/vietnam"}
   ]
 }

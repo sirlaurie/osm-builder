@@ -111,7 +111,7 @@ impl FallbackSource {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Region {
     pub id: String,
     pub extract: String,
@@ -260,6 +260,224 @@ pub fn regions(path: &Path) -> Result<Vec<Region>> {
         );
     }
     Ok(config.regions)
+}
+
+pub fn write_regions(path: &Path, entries: &[Region]) -> Result<()> {
+    ensure!(
+        (1..=256).contains(&entries.len()),
+        "Configure between 1 and 256 regional jobs"
+    );
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|first, second| first.id.cmp(&second.id));
+    let mut ids = HashSet::new();
+    let mut extracts = HashSet::new();
+    let mut lines = Vec::with_capacity(sorted.len());
+    for entry in &sorted {
+        ensure!(
+            is_region(&entry.id) && ids.insert(&entry.id),
+            "Invalid or duplicate region id"
+        );
+        ensure!(
+            valid_extract(&entry.extract),
+            "Invalid extract path: {}",
+            entry.extract
+        );
+        ensure!(
+            extracts.insert(&entry.extract),
+            "Duplicate extract: {}",
+            entry.extract
+        );
+        lines.push(format!("    {}", serde_json::to_string(entry)?));
+    }
+    let payload = format!("{{\n  \"regions\": [\n{}\n  ]\n}}\n", lines.join(",\n"));
+    atomic_write(path, payload.as_bytes())
+}
+
+fn special_extract_countries(extract: &str) -> &'static [&'static str] {
+    match extract {
+        "asia/gcc-states" => &["AE", "BH", "KW", "OM", "QA", "SA"],
+        "asia/malaysia-singapore-brunei" => &["BN", "MY", "SG"],
+        "asia/israel-and-palestine" => &["IL", "PS"],
+        "africa/senegal-and-gambia" => &["GM", "SN"],
+        "central-america/haiti-and-domrep" => &["DO", "HT"],
+        "europe/guernsey-jersey" => &["GG", "JE"],
+        "europe/ireland-and-northern-ireland" => &["IE"],
+        "asia/china/hong-kong" => &["HK"],
+        "asia/china/macau" => &["MO"],
+        "europe/kosovo" => &["XK"],
+        "europe/france/guadeloupe" => &["BL", "GP", "MF"],
+        "europe/france/guyane" => &["GF"],
+        "europe/france/martinique" => &["MQ"],
+        "europe/france/mayotte" => &["YT"],
+        "europe/france/reunion" => &["RE"],
+        "australia-oceania/australia/christmas-island" => &["CX"],
+        "australia-oceania/australia/cocos-islands" => &["CC"],
+        "australia-oceania/australia/heard-mcdonald" => &["HM"],
+        "australia-oceania/australia/norfolk-island" => &["NF"],
+        "australia-oceania/polynesie-francaise" => &["PF"],
+        "australia-oceania/wallis-et-futuna" => &["WF"],
+        "australia-oceania/tokelau" => &["TK"],
+        "australia-oceania/pitcairn-islands" => &["PN"],
+        "australia-oceania/american-oceania" => &["AS", "GU", "MP", "UM"],
+        _ => &[],
+    }
+}
+
+fn special_country_region(country: &str) -> Option<Region> {
+    let (id, extract) = match country {
+        "AE" | "BH" | "KW" | "OM" | "QA" | "SA" => ("gcc", "asia/gcc-states"),
+        "BN" | "MY" | "SG" => ("my-sg-bn", "asia/malaysia-singapore-brunei"),
+        "IL" | "PS" => ("il-ps", "asia/israel-and-palestine"),
+        "GM" | "SN" => ("sn-gm", "africa/senegal-and-gambia"),
+        "DO" | "HT" => ("ht-do", "central-america/haiti-and-domrep"),
+        "GG" | "JE" => ("eu-guernsey-jersey", "europe/guernsey-jersey"),
+        "IE" => (
+            "eu-ireland-and-northern-ireland",
+            "europe/ireland-and-northern-ireland",
+        ),
+        "HK" => ("cn-hong-kong", "asia/china/hong-kong"),
+        "MO" => ("cn-macau", "asia/china/macau"),
+        "XK" => ("eu-kosovo", "europe/kosovo"),
+        "BL" | "GP" | "MF" => ("eu-france-guadeloupe", "europe/france/guadeloupe"),
+        "GF" => ("eu-france-guyane", "europe/france/guyane"),
+        "MQ" => ("eu-france-martinique", "europe/france/martinique"),
+        "YT" => ("eu-france-mayotte", "europe/france/mayotte"),
+        "RE" => ("eu-france-reunion", "europe/france/reunion"),
+        "CX" => (
+            "au-christmas-island",
+            "australia-oceania/australia/christmas-island",
+        ),
+        "CC" => (
+            "au-cocos-islands",
+            "australia-oceania/australia/cocos-islands",
+        ),
+        "HM" => (
+            "au-heard-mcdonald",
+            "australia-oceania/australia/heard-mcdonald",
+        ),
+        "NF" => (
+            "au-norfolk-island",
+            "australia-oceania/australia/norfolk-island",
+        ),
+        "PF" => ("pf", "australia-oceania/polynesie-francaise"),
+        "WF" => ("wf", "australia-oceania/wallis-et-futuna"),
+        "TK" => ("tk", "australia-oceania/tokelau"),
+        "PN" => ("pn", "australia-oceania/pitcairn-islands"),
+        "AS" | "GU" | "MP" | "UM" => ("american-oceania", "australia-oceania/american-oceania"),
+        "VU" => ("vu", "australia-oceania/vanuatu"),
+        "MH" => ("mh", "australia-oceania/marshall-islands"),
+        _ => return None,
+    };
+    Some(Region {
+        id: id.into(),
+        extract: extract.into(),
+    })
+}
+
+pub fn resolve_missing_countries(
+    configured: &[Region],
+    catalog_bytes: &[u8],
+    countries: &[String],
+) -> Result<Vec<Region>> {
+    let catalog: Value = serde_json::from_slice(catalog_bytes)?;
+    let features = catalog["features"]
+        .as_array()
+        .context("Invalid Geofabrik catalog")?;
+    let mut covered = HashSet::new();
+    for entry in configured {
+        for code in special_extract_countries(&entry.extract) {
+            covered.insert((*code).to_owned());
+        }
+    }
+    let mut catalog_by_iso = std::collections::BTreeMap::new();
+    for feature in features {
+        let Some(pbf) = feature["properties"]["urls"]["pbf"].as_str() else {
+            continue;
+        };
+        let Some(extract) = pbf
+            .strip_prefix("https://download.geofabrik.de/")
+            .and_then(|value| value.strip_suffix("-latest.osm.pbf"))
+        else {
+            continue;
+        };
+        if !valid_extract(extract) || !special_extract_countries(extract).is_empty() {
+            continue;
+        }
+        if matches!(extract, "australia-oceania/ile-de-clipperton") {
+            continue;
+        }
+        let Some(codes) = feature["properties"]["iso3166-1:alpha2"].as_array() else {
+            continue;
+        };
+        let prefix = format!("{extract}/");
+        let is_configured = configured.iter().any(|entry| {
+            entry.extract == extract
+                || (extract != "asia/china" && entry.extract.starts_with(&prefix))
+        });
+        for code in codes.iter().filter_map(Value::as_str) {
+            if is_configured {
+                covered.insert(code.to_owned());
+            }
+            if codes.len() == 1 {
+                catalog_by_iso
+                    .entry(code.to_owned())
+                    .or_insert_with(|| extract.to_owned());
+            }
+        }
+    }
+    let mut existing_ids: HashSet<String> =
+        configured.iter().map(|entry| entry.id.clone()).collect();
+    let mut existing_extracts: HashSet<String> = configured
+        .iter()
+        .map(|entry| entry.extract.clone())
+        .collect();
+    let mut added = Vec::new();
+    for raw in countries {
+        let code = raw.trim().to_ascii_uppercase();
+        if matches!(code.as_str(), "" | "CN" | "RU" | "XX") {
+            continue;
+        }
+        ensure!(
+            code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_uppercase()),
+            "Invalid ISO 3166-1 alpha-2 country code: {raw}"
+        );
+        if covered.contains(&code) {
+            continue;
+        }
+        let candidate = if let Some(region) = special_country_region(&code) {
+            region
+        } else {
+            let extract = catalog_by_iso
+                .get(&code)
+                .with_context(|| format!("Country {code} is not present in the Geofabrik catalog"))?
+                .clone();
+            let preferred_id = code.to_ascii_lowercase();
+            let id = if !existing_ids.contains(&preferred_id) {
+                preferred_id
+            } else {
+                extract
+                    .rsplit('/')
+                    .next()
+                    .context("Invalid extract path")?
+                    .to_owned()
+            };
+            Region { id, extract }
+        };
+        covered.insert(code);
+        for extra in special_extract_countries(&candidate.extract) {
+            covered.insert((*extra).to_owned());
+        }
+        if existing_extracts.insert(candidate.extract.clone()) {
+            ensure!(
+                existing_ids.insert(candidate.id.clone()),
+                "Duplicate region id {} while resolving new countries",
+                candidate.id
+            );
+            added.push(candidate);
+        }
+    }
+    added.sort_by(|first, second| first.id.cmp(&second.id));
+    Ok(added)
 }
 
 fn catalog_entry(entry: &Region, bytes: &[u8]) -> Result<(Value, String)> {
@@ -689,5 +907,75 @@ mod tests {
         assert_eq!(sequence_path(42).unwrap(), "000/000/042");
         assert_eq!(sequence_path(999_999_999).unwrap(), "999/999/999");
         assert!(sequence_path(1_000_000_000).is_err());
+    }
+
+    #[test]
+    fn resolve_missing_countries_skips_covered_and_excluded_and_maps_new_codes() {
+        let configured =
+            regions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("config/regions.json")).unwrap();
+        let catalog = serde_json::to_vec(&serde_json::json!({
+            "features": [
+                {
+                    "properties": {
+                        "id": "us",
+                        "iso3166-1:alpha2": ["US"],
+                        "urls": { "pbf": "https://download.geofabrik.de/north-america/us-latest.osm.pbf" }
+                    }
+                },
+                {
+                    "properties": {
+                        "id": "china",
+                        "iso3166-1:alpha2": ["CN"],
+                        "urls": { "pbf": "https://download.geofabrik.de/asia/china-latest.osm.pbf" }
+                    }
+                },
+                {
+                    "properties": {
+                        "id": "russia",
+                        "iso3166-1:alpha2": ["RU"],
+                        "urls": { "pbf": "https://download.geofabrik.de/russia-latest.osm.pbf" }
+                    }
+                },
+                {
+                    "properties": {
+                        "id": "chile",
+                        "iso3166-1:alpha2": ["CL"],
+                        "urls": { "pbf": "https://download.geofabrik.de/south-america/chile-latest.osm.pbf" }
+                    }
+                },
+                {
+                    "properties": {
+                        "id": "philippines",
+                        "iso3166-1:alpha2": ["PH"],
+                        "urls": { "pbf": "https://download.geofabrik.de/asia/philippines-latest.osm.pbf" }
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+        let countries = vec![
+            "CN".into(),
+            "RU".into(),
+            "US".into(),
+            "SA".into(),
+            "SG".into(),
+            "HK".into(),
+            "PH".into(),
+            "CL".into(),
+        ];
+        let added = resolve_missing_countries(&configured, &catalog, &countries).unwrap();
+        assert_eq!(
+            added,
+            vec![
+                Region {
+                    id: "cl".into(),
+                    extract: "south-america/chile".into(),
+                },
+                Region {
+                    id: "ph".into(),
+                    extract: "asia/philippines".into(),
+                },
+            ]
+        );
     }
 }

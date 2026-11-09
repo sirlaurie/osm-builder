@@ -1,80 +1,75 @@
 # OSM Builder
 
-OSM Builder 下载、处理和上传 OpenStreetMap 地点数据。数据存储：Cloudflare R2。[OSM Worker](https://github.com/sirlaurie/osm-worker) 读取这些数据，提供查询接口。
+下载、编译并向 Cloudflare R2 发布 OpenStreetMap 地区数据，供 [OSM Worker](https://github.com/sirlaurie/osm-worker) 查询。部署时先上线 OSM Worker，再配置本项目。
 
-部署顺序：
+## 编译与配置
 
-1. OSM Worker
-2. OSM Builder
-
-## 安装
-
-环境要求：macOS 或 Linux、Rust 1.95+、C/C++ 编译工具。
+需要 macOS 或 Linux、Rust 1.95+、C/C++ 工具链。编译产物位于 `.build/tools/rust/release/osm`：
 
 ```sh
 cargo build --release
 ```
 
-配置步骤：
-
-1. 创建 Cloudflare [R2 API 令牌](https://developers.cloudflare.com/r2/api/tokens/)。令牌权限：Object Read & Write。
-2. 创建 `osm-builder/.env` 文件。文件内容：
+在项目根目录创建 `.env`（R2 API 令牌需具备 Object Read & Write 权限）：
 
 ```dotenv
 R2_ACCOUNT_ID="<Cloudflare 账户 ID>"
 R2_BUCKET="path-osm-data"
 AWS_ACCESS_KEY_ID="<R2 Access Key ID>"
 AWS_SECRET_ACCESS_KEY="<R2 Secret Access Key>"
-OSM_WORKER_URL="https://aura-osm-data.<你的子域>.workers.dev"
-OSM_PUBLISH_TOKEN="<OSM Worker 的 PUBLISH_TOKEN>"
+OSM_WORKER_URL="https://aura-osm-data.<子域>.workers.dev"
+OSM_PUBLISH_TOKEN="<与 OSM Worker 及 Purchase Worker 相同的 PUBLISH_TOKEN>"
 ```
 
-默认数据目录：`.build/data`。自定义数据目录：设置 `OSM_DATA_DIR`。磁盘可用空间要求：10 GiB 或以上。
+本地数据默认存放在 `.build/data`，可通过 `OSM_DATA_DIR` 修改，所在磁盘至少保留 10 GiB 可用空间。多台处理设备共用同一个 OSM Worker 和 R2 存储桶，但各自的 `.device-id` 不可复制。
 
-## 使用
+## 常用命令
 
-| 操作 | 命令 |
+| 命令 | 说明 |
 | --- | --- |
-| 查看可用地区 | `osm list` |
-| 处理任务（每台处理设备） | `osm work --cleanup` |
-| 安装或重启后台驻留服务（macOS / Linux） | `osm service --cleanup` |
-| 远程更新全部处理设备 | `osm deploy` |
-| 提交首次构建 | `osm bootstrap all --submit-only` |
-| 提交更新 | `osm update all --submit-only` |
-| 查看任务进度和失败原因 | `osm jobs` |
-| 查看已发布地区 | `osm published-state` |
-| 取消未完成的批次 | `osm cancel` |
-| 下线地区 | `osm retire <地区>` |
-| 删除 R2 中不再使用的数据 | `osm gc --apply` |
+| `osm list` | 列出 `config/regions.json` 中的全部地区 |
+| `osm sync-regions` | 拉取线上用户分布国家，将未覆盖国家写入 `config/regions.json` |
+| `osm sync-regions --submit` | 同步新增国家并提交更新批次 |
+| `osm bootstrap <地区\|all> --submit-only` | 提交首次构建批次 |
+| `osm update <地区\|all> --submit-only` | 提交增量更新批次（指定 `all` 时先同步用户国家，加 `--no-sync-regions` 跳过） |
+| `osm work --cleanup` | 领取并处理队列任务，发布确认后删除本地临时数据 |
+| `osm service --cleanup` | 在本机安装或重启后台常驻服务（macOS `launchd` / Linux `systemd`） |
+| `osm deploy` | 通过 SSH 让所有工作机拉取代码、编译并平滑重启后台服务 |
+| `osm jobs` | 查看当前批次进度与失败原因 |
+| `osm published-state` | 查看线上已发布的地区与版本 |
+| `osm cancel` | 取消未完成的批次 |
+| `osm retire <地区>` | 下线指定地区 |
+| `osm gc --apply` | 清理 R2 中不再被引用的数据块 |
 
-`osm` 的路径：`.build/tools/rust/release/osm`。
+## 工作机常驻与远程发布
 
-`bootstrap` 和 `update` 接受一个或多个地区名。`all` 表示 `config/regions.json` 中的全部地区。
+1. **首次在工作机安装服务**
+   - macOS 工作机请将仓库放在 `~/osm-builder` 等目录，避开受 TCC 隐私保护的 `~/Documents`、`~/Desktop`、`~/Downloads`（`launchd` 访问这些目录会触发弹窗并挂起进程）。
+   - Linux 先开启用户级后台驻留：`loginctl enable-linger "$USER"`。
+   - 在每台工作机的仓库目录执行：
+     ```sh
+     cargo build --release && .build/tools/rust/release/osm service --cleanup
+     ```
+     该命令会注册后台服务，并将当前仓库路径记录到 `~/.config/aura-osm/root`。
 
-所有处理设备共用仓库、OSM Worker 和 R2 存储桶。`.device-id` 文件属于单台设备，禁止复制。
+2. **在开发机配置工作机列表**
+   在开发机的 `.env` 中添加 `OSM_WORKER_HOSTS`。若已在工作机执行过 `osm service`，填 SSH 主机名即可；也可通过 `host:path` 显式指定远端目录：
+   ```dotenv
+   OSM_WORKER_HOSTS="mac-mini,debian"
+   ```
 
-## 后台服务与远程发布
+3. **日常推送更新**
+   开发机提交并推送 Git 后执行：
+   ```sh
+   osm deploy
+   ```
+   `osm deploy` 会依次连接各台工作机拉取代码、编译并执行 `osm service --cleanup`。旧进程收到 `SIGTERM` 后不再领取新任务，等待手头正在处理的地区上传并清理完毕后退出（最长等待 3600 秒），随后由新进程接管。
 
-1. 首次初始化：
-   - Debian 开启用户级后台常驻：`loginctl enable-linger "$USER"`。
-   - Mac mini 和 Debian 在各自仓库目录执行：`cargo build --release && .build/tools/rust/release/osm service --cleanup`（该命令同时将本机仓库路径写入 `~/.config/aura-osm/root`）。
-2. 开发机 `osm-builder/.env` 配置目标机器（支持 `host:path` 指定不同路径，或填 `host` 读取远端 `~/.config/aura-osm/root`）：
+## 地区扩容与每月更新
 
-```dotenv
-OSM_WORKER_HOSTS="mac-mini:/Users/<user>/Aura/osm-builder,debian:/home/<user>/Aura/osm-builder"
-```
+`osm sync-regions` 会携带 `OSM_PUBLISH_TOKEN` 请求 `https://apple.autheai.com/api/user_countries`（可通过 `OSM_USER_COUNTRIES_URL` 覆盖），筛选生产环境用户数大于 1 的国家（排除 `CN`、`RU`），将尚未覆盖的国家补充到 `config/regions.json`。
 
-3. 日常代码发布（开发机 `git push` 后执行）：
-
-```sh
-osm deploy
-```
-
-`osm deploy` 登录各台机器拉取代码、编译并执行 `osm service --cleanup`。`osm service --cleanup` 向旧进程发送 `SIGTERM`。空闲线程立即退出；运行中的任务完成当前地区的处理、上传与清理后退出（最长等待 3600 秒），然后启动新进程。
-
-## 每月更新
-
-执行设备：一台 Linux 设备。执行方式：cron 或 systemd timer。命令：
+每月全量更新可在 macOS 上通过 `osm schedule` 安装定时任务，或在 Linux 上配置 cron / systemd timer：
 
 ```sh
 cd /path/to/osm-builder && git pull --ff-only && cargo build --release \
@@ -82,12 +77,8 @@ cd /path/to/osm-builder && git pull --ff-only && cargo build --release \
        .build/tools/rust/release/osm update all --submit-only --replace; }
 ```
 
-命令失败的处理：人工处理。定时任务需要失败通知。
-
-Mac 的每月更新任务：`osm schedule`。
-
-## 开发
+## 测试
 
 ```sh
-cargo test   # 依赖：osmium-tool
+cargo test   # 需安装 osmium-tool
 ```

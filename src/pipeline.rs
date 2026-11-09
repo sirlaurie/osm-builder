@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, Weak,
@@ -25,7 +25,20 @@ use crate::{
 };
 
 const INDEX_URL: &str = "https://download.geofabrik.de/index-v1.json";
+const DEFAULT_USER_COUNTRIES_URL: &str = "https://apple.autheai.com/api/user_countries";
+const MAX_USER_COUNTRIES_RESPONSE: usize = 64 * 1024;
 const FINISHED_BATCH_POLL: Duration = Duration::from_secs(300);
+
+#[derive(serde::Deserialize)]
+struct UserCountriesPayload {
+    countries: Vec<UserCountryEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct UserCountryEntry {
+    country: String,
+    users: u64,
+}
 
 fn disk_check(directory: &Path, minimum_gib: u64) -> Result<()> {
     let available = fs2::available_space(directory)
@@ -1454,6 +1467,142 @@ pub fn submit(
         );
     }
     Ok(batch)
+}
+
+fn parse_user_countries(bytes: &[u8]) -> Result<Vec<String>> {
+    let payload: UserCountriesPayload =
+        serde_json::from_slice(bytes).context("Invalid user countries response JSON")?;
+    let mut codes = BTreeSet::new();
+    for entry in payload.countries {
+        let code = entry.country.trim().to_ascii_uppercase();
+        ensure!(
+            code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_uppercase()),
+            "Invalid country code in user countries response: {}",
+            entry.country
+        );
+        if entry.users > 1 && !matches!(code.as_str(), "CN" | "RU") {
+            codes.insert(code);
+        }
+    }
+    Ok(codes.into_iter().collect())
+}
+
+fn fetch_user_countries(runtime: &Runtime, environment: &Environment) -> Result<Vec<String>> {
+    let token = environment
+        .get("OSM_PUBLISH_TOKEN")
+        .filter(|value| !value.trim().is_empty())
+        .context("Missing OSM_PUBLISH_TOKEN")?;
+    ensure!(
+        token.chars().count() >= 32 && !token.contains(['\r', '\n']),
+        "Invalid OSM_PUBLISH_TOKEN"
+    );
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .context("Invalid OSM_PUBLISH_TOKEN")?;
+    authorization.set_sensitive(true);
+    let raw_url = environment
+        .get("OSM_USER_COUNTRIES_URL")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_USER_COUNTRIES_URL);
+    let url = reqwest::Url::parse(raw_url).context("Invalid OSM_USER_COUNTRIES_URL")?;
+    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    ensure!(
+        (url.scheme() == "https" || (url.scheme() == "http" && local))
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none(),
+        "OSM_USER_COUNTRIES_URL requires HTTPS (or loopback HTTP) without credentials"
+    );
+    let mut builder = reqwest::blocking::Client::builder()
+        .connect_timeout(runtime.connect_timeout)
+        .timeout(runtime.metadata_timeout)
+        .redirect(Policy::none());
+    if local {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build()?;
+    let bytes = crate::network::retry(runtime.download_retry_delay, || {
+        let response = client
+            .get(url.clone())
+            .header(reqwest::header::AUTHORIZATION, authorization.clone())
+            .send()
+            .map_err(crate::network::request)?;
+        let status = response.status();
+        if crate::network::retryable_status(status) {
+            return Err(crate::network::Transient(format!(
+                "User countries request failed: HTTP {}",
+                status.as_u16()
+            ))
+            .into());
+        }
+        ensure!(
+            status.is_success(),
+            "User countries request rejected: HTTP {}",
+            status.as_u16()
+        );
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|size| size <= MAX_USER_COUNTRIES_RESPONSE as u64),
+            "User countries response is too large"
+        );
+        let mut body = Vec::new();
+        std::io::Read::take(response, MAX_USER_COUNTRIES_RESPONSE as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|error| {
+                crate::network::Transient(format!(
+                    "User countries response read failed ({:?})",
+                    error.kind()
+                ))
+            })?;
+        ensure!(
+            body.len() <= MAX_USER_COUNTRIES_RESPONSE,
+            "User countries response is too large"
+        );
+        Ok(body)
+    })?;
+    parse_user_countries(&bytes)
+}
+
+pub fn sync_regions(
+    root: &Path,
+    runtime: &Runtime,
+    environment: &Environment,
+) -> Result<Vec<Region>> {
+    sync_regions_with_catalog(root, runtime, environment, None)
+}
+
+fn sync_regions_with_catalog(
+    root: &Path,
+    runtime: &Runtime,
+    environment: &Environment,
+    catalog_override: Option<&Path>,
+) -> Result<Vec<Region>> {
+    let codes = fetch_user_countries(runtime, environment)?;
+    if codes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let regions_path = root.join("config/regions.json");
+    let mut configured = source::regions(&regions_path)?;
+    let catalog_bytes = match catalog_override {
+        Some(path) => fs::read(path)?,
+        None => {
+            let scratch = root.join(".build/tools/tmp");
+            fs::create_dir_all(&scratch)?;
+            let work = tempfile::Builder::new()
+                .prefix("catalog-")
+                .tempdir_in(&scratch)?;
+            let catalog_path = work.path().join("index.json");
+            let downloader = Downloader::new(runtime)?;
+            downloader.download(runtime, INDEX_URL, &catalog_path, Some(64 * 1024 * 1024))?;
+            fs::read(&catalog_path)?
+        }
+    };
+    let added = source::resolve_missing_countries(&configured, &catalog_bytes, &codes)?;
+    if !added.is_empty() {
+        configured.extend(added.iter().cloned());
+        source::write_regions(&regions_path, &configured)?;
+    }
+    Ok(added)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5076,5 +5225,150 @@ mod tests {
         )
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn sync_regions_fetches_authenticated_user_countries_and_updates_regions_config() {
+        use std::net::TcpListener;
+
+        let work = work();
+        let config_dir = work.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let initial = vec![
+            Region {
+                id: "cn-hong-kong".into(),
+                extract: "asia/china/hong-kong".into(),
+            },
+            Region {
+                id: "cn-jiangsu".into(),
+                extract: "asia/china/jiangsu".into(),
+            },
+            Region {
+                id: "jp".into(),
+                extract: "asia/japan".into(),
+            },
+        ];
+        source::write_regions(&config_dir.join("regions.json"), &initial).unwrap();
+
+        let catalog = work.path().join("catalog.json");
+        fs::write(
+            &catalog,
+            serde_json::to_vec(&json!({
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": "japan",
+                            "iso3166-1:alpha2": ["JP"],
+                            "urls": { "pbf": "https://download.geofabrik.de/asia/japan-latest.osm.pbf" }
+                        }
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": "china",
+                            "iso3166-1:alpha2": ["CN"],
+                            "urls": { "pbf": "https://download.geofabrik.de/asia/china-latest.osm.pbf" }
+                        }
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": "kazakhstan",
+                            "iso3166-1:alpha2": ["KZ"],
+                            "urls": { "pbf": "https://download.geofabrik.de/asia/kazakhstan-latest.osm.pbf" }
+                        }
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": "peru",
+                            "iso3166-1:alpha2": ["PE"],
+                            "urls": { "pbf": "https://download.geofabrik.de/south-america/peru-latest.osm.pbf" }
+                        }
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let count = stream.read(&mut request).unwrap();
+            let text = String::from_utf8_lossy(&request[..count]);
+            assert!(text.starts_with("GET /api/user_countries HTTP/1.1\r\n"));
+            assert!(
+                text.to_ascii_lowercase()
+                    .contains("authorization: bearer 0123456789abcdef0123456789abcdef\r\n")
+            );
+            let body = serde_json::to_vec(&json!({
+                "countries": [
+                    { "country": "CN", "users": 50 },
+                    { "country": "RU", "users": 10 },
+                    { "country": "HK", "users": 8 },
+                    { "country": "JP", "users": 20 },
+                    { "country": "KZ", "users": 3 },
+                    { "country": "PE", "users": 1 }
+                ]
+            }))
+            .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let environment = Environment::from_values(BTreeMap::from([
+            (
+                "OSM_PUBLISH_TOKEN".into(),
+                "0123456789abcdef0123456789abcdef".into(),
+            ),
+            (
+                "OSM_USER_COUNTRIES_URL".into(),
+                format!("http://{addr}/api/user_countries"),
+            ),
+        ]));
+        let added =
+            sync_regions_with_catalog(work.path(), &runtime(), &environment, Some(&catalog))
+                .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            added,
+            vec![Region {
+                id: "kz".into(),
+                extract: "asia/kazakhstan".into(),
+            }]
+        );
+        let updated = source::regions(&config_dir.join("regions.json")).unwrap();
+        assert_eq!(
+            updated,
+            vec![
+                Region {
+                    id: "cn-hong-kong".into(),
+                    extract: "asia/china/hong-kong".into(),
+                },
+                Region {
+                    id: "cn-jiangsu".into(),
+                    extract: "asia/china/jiangsu".into(),
+                },
+                Region {
+                    id: "jp".into(),
+                    extract: "asia/japan".into(),
+                },
+                Region {
+                    id: "kz".into(),
+                    extract: "asia/kazakhstan".into(),
+                },
+            ]
+        );
     }
 }

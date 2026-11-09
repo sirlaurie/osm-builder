@@ -78,6 +78,13 @@ enum Action {
             help = "Cancel an unfinished batch before submitting"
         )]
         replace: bool,
+        #[arg(long, help = "Skip syncing user countries before updating all regions")]
+        no_sync_regions: bool,
+    },
+    #[command(about = "Detect new user countries and add missing regions to config/regions.json")]
+    SyncRegions {
+        #[arg(long, help = "Submit an update batch for newly added regions")]
+        submit: bool,
     },
     #[command(about = "Cancel the unfinished cloud batch")]
     Cancel,
@@ -234,11 +241,38 @@ fn run(cli: Cli) -> Result<()> {
             regions,
             submit_only: true,
             replace,
+            no_sync_regions,
         } => {
+            if !*no_sync_regions && *regions == ["all"] {
+                for entry in pipeline::sync_regions(&root, &runtime, &environment)? {
+                    println!("Added region: {} ({})", entry.id, entry.extract);
+                }
+            }
             println!(
                 "Submitted batch: {}",
                 pipeline::submit(&root, &runtime, &environment, "update", regions, *replace)?
             );
+            return Ok(());
+        }
+        Action::SyncRegions { submit } => {
+            let added = pipeline::sync_regions(&root, &runtime, &environment)?;
+            if added.is_empty() {
+                println!("No new user countries to add");
+                return Ok(());
+            }
+            for entry in &added {
+                println!("Added region: {} ({})", entry.id, entry.extract);
+            }
+            if *submit {
+                let ids = added
+                    .iter()
+                    .map(|entry| entry.id.clone())
+                    .collect::<Vec<_>>();
+                println!(
+                    "Submitted batch: {}",
+                    pipeline::submit(&root, &runtime, &environment, "update", &ids, false)?
+                );
+            }
             return Ok(());
         }
         _ => {}
@@ -296,15 +330,27 @@ fn run(cli: Cli) -> Result<()> {
             None,
             cleanup,
         )?,
-        Action::Update { regions, .. } => pipeline::run(
-            &root,
-            &runtime,
-            &environment,
-            "update",
-            &regions,
-            None,
-            false,
-        )?,
+        Action::Update {
+            regions,
+            no_sync_regions,
+            ..
+        } => {
+            if !no_sync_regions && regions == ["all"] {
+                for entry in pipeline::sync_regions(&root, &runtime, &environment)? {
+                    println!("Added region: {} ({})", entry.id, entry.extract);
+                }
+            }
+            pipeline::run(
+                &root,
+                &runtime,
+                &environment,
+                "update",
+                &regions,
+                None,
+                false,
+            )?
+        }
+        Action::SyncRegions { .. } => unreachable!(),
         Action::Publish { directory } => {
             let publisher =
                 Publisher::new(&runtime, &PublishConfig::from_environment(&environment)?)?;

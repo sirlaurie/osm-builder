@@ -127,6 +127,20 @@ pub fn worker_systemd_unit(root: &Path, executable: &Path, cleanup: bool) -> Res
     ))
 }
 
+fn reject_macos_tcc_directory(root: &Path, home: &Path) -> Result<()> {
+    for folder in ["Documents", "Desktop", "Downloads"] {
+        let protected = home.join(folder);
+        ensure!(
+            !root.starts_with(&protected),
+            "macOS launchd services cannot run inside {} ({}) due to TCC folder protection; move the repository outside ~/Documents, ~/Desktop and ~/Downloads (for example {}/osm-builder)",
+            protected.display(),
+            root.display(),
+            home.display()
+        );
+    }
+    Ok(())
+}
+
 pub fn install_worker(
     root: &Path,
     environment: &Environment,
@@ -156,6 +170,9 @@ pub fn install_worker(
             .context("Root pointer path has no parent")?,
     )?;
     let canonical_root = root.canonicalize()?;
+    if cfg!(target_os = "macos") {
+        reject_macos_tcc_directory(&canonical_root, Path::new(home))?;
+    }
     let root_text = canonical_root
         .to_str()
         .context("Service paths must be valid UTF-8")?;
@@ -397,6 +414,7 @@ pub fn run(
     let home = environment
         .get("HOME")
         .context("HOME is required to install the monthly schedule")?;
+    reject_macos_tcc_directory(&root.canonicalize()?, Path::new(home))?;
     let path = Path::new(home)
         .join("Library/LaunchAgents")
         .join(format!("{LABEL}.plist"));
@@ -587,5 +605,18 @@ mod tests {
         assert!(debian_script.contains("cd \"$HOME\"/'work/osm-builder' && git pull --ff-only"));
         let pointer_script = remote_deploy_script(&targets[2], true).unwrap();
         assert!(pointer_script.contains(".config/aura-osm/root"));
+    }
+
+    #[test]
+    fn macos_tcc_protected_directories_are_rejected_for_launchd_services() {
+        let home = Path::new("/Users/lori");
+        for blocked in [
+            "/Users/lori/Documents/osm-builder",
+            "/Users/lori/Desktop/osm-builder",
+            "/Users/lori/Downloads/osm-builder",
+        ] {
+            assert!(reject_macos_tcc_directory(Path::new(blocked), home).is_err());
+        }
+        assert!(reject_macos_tcc_directory(Path::new("/Users/lori/osm-builder"), home).is_ok());
     }
 }
