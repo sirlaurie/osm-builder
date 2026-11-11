@@ -15,6 +15,9 @@ use crate::{
 pub const LABEL: &str = "com.autheai.osm-update";
 pub const WORKER_LABEL: &str = "com.autheai.osm-worker";
 pub const SYSTEMD_UNIT_NAME: &str = "osm-worker.service";
+const DRAIN_TIMEOUT_SECONDS: u32 = 3600;
+const LAUNCH_AGENT_EXIT_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(DRAIN_TIMEOUT_SECONDS as u64 + 60);
 pub const ROOT_POINTER_RELATIVE: &str = ".config/aura-osm/root";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,7 +51,10 @@ pub fn worker_plist_definition(root: &Path, cleanup: bool) -> Result<Value> {
     definition.insert("RunAtLoad".into(), Value::Boolean(true));
     definition.insert("KeepAlive".into(), Value::Boolean(true));
     definition.insert("ThrottleInterval".into(), Value::Integer(10.into()));
-    definition.insert("ExitTimeOut".into(), Value::Integer(3600.into()));
+    definition.insert(
+        "ExitTimeOut".into(),
+        Value::Integer(DRAIN_TIMEOUT_SECONDS.into()),
+    );
     definition.insert("Umask".into(), Value::Integer(0o077.into()));
     definition.insert(
         "StandardOutPath".into(),
@@ -117,7 +123,7 @@ pub fn worker_systemd_unit(root: &Path, executable: &Path, cleanup: bool) -> Res
          ExecStart={command}\n\
          Restart=always\n\
          RestartSec=10\n\
-         TimeoutStopSec=3600\n\
+         TimeoutStopSec={DRAIN_TIMEOUT_SECONDS}\n\
          KillSignal=SIGTERM\n\
          UMask=0077\n\
          \n\
@@ -138,6 +144,46 @@ fn reject_macos_tcc_directory(root: &Path, home: &Path) -> Result<()> {
             home.display()
         );
     }
+    Ok(())
+}
+
+fn launch_agent_loaded(target: &str) -> Result<bool> {
+    Ok(Command::new("/bin/launchctl")
+        .args(["print", target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success())
+}
+
+fn reload_launch_agent(label: &str, path: &Path) -> Result<()> {
+    let domain = format!("gui/{}", rustix::process::getuid().as_raw());
+    let target = format!("{domain}/{label}");
+    if launch_agent_loaded(&target)? {
+        ensure!(
+            Command::new("/bin/launchctl")
+                .args(["bootout", &target])
+                .status()?
+                .success(),
+            "Cannot unload the existing {label} service"
+        );
+        let deadline = std::time::Instant::now() + LAUNCH_AGENT_EXIT_WAIT;
+        while launch_agent_loaded(&target)? {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "The existing {label} service did not exit; the new definition is not loaded"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    ensure!(
+        Command::new("/bin/launchctl")
+            .args(["bootstrap", &domain])
+            .arg(path)
+            .status()?
+            .success(),
+        "Cannot install the {label} service"
+    );
     Ok(())
 }
 
@@ -182,33 +228,9 @@ pub fn install_worker(
             .join("Library/LaunchAgents")
             .join(format!("{WORKER_LABEL}.plist"));
         let definition = worker_plist_definition(root, cleanup)?;
-        let uid = rustix::process::getuid().as_raw();
         fs::create_dir_all(root.join(".build/tools/logs"))?;
         write_plist(&path, &definition)?;
-        let domain = format!("gui/{uid}");
-        let target = format!("{domain}/{WORKER_LABEL}");
-        let loaded = Command::new("/bin/launchctl")
-            .args(["print", &target])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if loaded.success() {
-            ensure!(
-                Command::new("/bin/launchctl")
-                    .args(["bootout", &target])
-                    .status()?
-                    .success(),
-                "Cannot unload the existing worker service"
-            );
-        }
-        ensure!(
-            Command::new("/bin/launchctl")
-                .args(["bootstrap", &domain])
-                .arg(&path)
-                .status()?
-                .success(),
-            "Cannot install the worker service"
-        );
+        reload_launch_agent(WORKER_LABEL, &path)?;
         return Ok(path);
     }
     ensure!(
@@ -419,33 +441,9 @@ pub fn run(
         .join("Library/LaunchAgents")
         .join(format!("{LABEL}.plist"));
     let definition = job_definition(root, runtime)?;
-    let uid = rustix::process::getuid().as_raw();
     fs::create_dir_all(root.join(".build/tools/logs"))?;
     write_plist(&path, &definition)?;
-    let domain = format!("gui/{uid}");
-    let target = format!("{domain}/{LABEL}");
-    let loaded = Command::new("/bin/launchctl")
-        .args(["print", &target])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if loaded.success() {
-        ensure!(
-            Command::new("/bin/launchctl")
-                .args(["bootout", &target])
-                .status()?
-                .success(),
-            "Cannot unload the existing monthly schedule"
-        );
-    }
-    ensure!(
-        Command::new("/bin/launchctl")
-            .args(["bootstrap", &domain])
-            .arg(&path)
-            .status()?
-            .success(),
-        "Cannot install the monthly schedule"
-    );
+    reload_launch_agent(LABEL, &path)?;
     Ok(path)
 }
 

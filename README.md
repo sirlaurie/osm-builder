@@ -29,9 +29,9 @@ OSM_PUBLISH_TOKEN="<与 OSM Worker 及 Purchase Worker 相同的 PUBLISH_TOKEN>"
 | --- | --- |
 | `osm list` | 列出 `config/regions.json` 中的全部地区 |
 | `osm sync-regions` | 拉取线上用户分布国家，将未覆盖国家写入 `config/regions.json` |
-| `osm sync-regions --submit` | 同步新增国家并提交更新批次 |
+| `osm sync-regions --submit` | 先为新增国家提交更新批次，提交成功后写入 `config/regions.json` |
 | `osm bootstrap <地区\|all> --submit-only` | 提交首次构建批次 |
-| `osm update <地区\|all> --submit-only` | 提交增量更新批次（指定 `all` 时先同步用户国家，加 `--no-sync-regions` 跳过） |
+| `osm update <地区\|all> --submit-only` | 提交增量更新批次（指定 `all` 时批次包含未覆盖的用户国家，不改写 `config/regions.json`；加 `--no-sync-regions` 跳过） |
 | `osm work --cleanup` | 领取并处理队列任务，发布确认后删除本地临时数据 |
 | `osm service --cleanup` | 在本机安装或重启后台常驻服务（macOS `launchd` / Linux `systemd`） |
 | `osm deploy` | 通过 SSH 让所有工作机拉取代码、编译并平滑重启后台服务 |
@@ -63,11 +63,13 @@ OSM_PUBLISH_TOKEN="<与 OSM Worker 及 Purchase Worker 相同的 PUBLISH_TOKEN>"
    ```sh
    osm deploy
    ```
-   `osm deploy` 会依次连接各台工作机拉取代码、编译并执行 `osm service --cleanup`。旧进程收到 `SIGTERM` 后不再领取新任务，等待手头正在处理的地区上传并清理完毕后退出（最长等待 3600 秒），随后由新进程接管。
+   `osm deploy` 会依次连接各台工作机拉取代码、编译并执行 `osm service --cleanup`。旧进程收到 `SIGTERM` 后不再领取新任务，等待手头正在处理的地区上传并清理完毕后退出（最长等待 3600 秒），随后由新进程接管。排空期间再次收到 `SIGTERM` 或 `SIGINT`，进程立即退出。
 
 ## 地区扩容与每月更新
 
-`osm sync-regions` 会携带 `OSM_PUBLISH_TOKEN` 请求 `https://apple.autheai.com/api/user_countries`（可通过 `OSM_USER_COUNTRIES_URL` 覆盖），筛选生产环境用户数大于 1 的国家（排除 `CN`、`RU`），将尚未覆盖的国家补充到 `config/regions.json`。
+`osm sync-regions` 会携带 `OSM_PUBLISH_TOKEN` 请求 `https://apple.autheai.com/api/user_countries`（可通过 `OSM_USER_COUNTRIES_URL` 覆盖），筛选生产环境用户数大于 1 的国家（排除 `CN`、`RU`），将尚未覆盖的国家补充到 `config/regions.json`。Geofabrik 目录中没有对应切片的国家会被跳过并输出提示。
+
+`config/regions.json` 以 git 为准。`osm update all --submit-only` 只在批次中加入新国家，不写文件。在开发机执行 `osm sync-regions` 并提交 git，新地区才进入配置。
 
 每月全量更新可在 macOS 上通过 `osm schedule` 安装定时任务，或在 Linux 上配置 cron / systemd timer：
 

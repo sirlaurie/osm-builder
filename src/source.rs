@@ -305,6 +305,7 @@ fn special_extract_countries(extract: &str) -> &'static [&'static str] {
         "asia/china/hong-kong" => &["HK"],
         "asia/china/macau" => &["MO"],
         "europe/kosovo" => &["XK"],
+        "europe/isle-of-man" => &["IM"],
         "europe/france/guadeloupe" => &["BL", "GP", "MF"],
         "europe/france/guyane" => &["GF"],
         "europe/france/martinique" => &["MQ"],
@@ -338,6 +339,7 @@ fn special_country_region(country: &str) -> Option<Region> {
         "HK" => ("cn-hong-kong", "asia/china/hong-kong"),
         "MO" => ("cn-macau", "asia/china/macau"),
         "XK" => ("eu-kosovo", "europe/kosovo"),
+        "IM" => ("eu-isle-of-man", "europe/isle-of-man"),
         "BL" | "GP" | "MF" => ("eu-france-guadeloupe", "europe/france/guadeloupe"),
         "GF" => ("eu-france-guyane", "europe/france/guyane"),
         "MQ" => ("eu-france-martinique", "europe/france/martinique"),
@@ -447,10 +449,12 @@ pub fn resolve_missing_countries(
         let candidate = if let Some(region) = special_country_region(&code) {
             region
         } else {
-            let extract = catalog_by_iso
-                .get(&code)
-                .with_context(|| format!("Country {code} is not present in the Geofabrik catalog"))?
-                .clone();
+            let Some(extract) = catalog_by_iso.get(&code).cloned() else {
+                crate::progress::message(&format!(
+                    "Country {code} has no Geofabrik extract mapping; skipped"
+                ));
+                continue;
+            };
             let preferred_id = code.to_ascii_lowercase();
             let id = if !existing_ids.contains(&preferred_id) {
                 preferred_id
@@ -962,6 +966,8 @@ mod tests {
             "HK".into(),
             "PH".into(),
             "CL".into(),
+            "IM".into(),
+            "TT".into(),
         ];
         let added = resolve_missing_countries(&configured, &catalog, &countries).unwrap();
         assert_eq!(

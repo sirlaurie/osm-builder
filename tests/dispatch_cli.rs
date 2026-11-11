@@ -242,8 +242,11 @@ fn submit_only_and_jobs_bypass_the_lock_held_by_a_processing_device() {
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("Another OSM pipeline is running"));
     assert!(server.requests.lock().unwrap().is_empty());
 
-    for mode in ["bootstrap", "update"] {
-        let output = invoke(project.path(), &[mode, "all", "--submit-only"]);
+    for arguments in [
+        &["bootstrap", "all", "--submit-only"][..],
+        &["update", "all", "--submit-only", "--no-sync-regions"][..],
+    ] {
+        let output = invoke(project.path(), arguments);
         assert!(
             output.status.success(),
             "{}",
@@ -317,7 +320,13 @@ fn replacing_submission_cancels_the_unfinished_batch_and_reports_unconfigured_pu
 
     let output = invoke(
         project.path(),
-        &["update", "all", "--submit-only", "--replace"],
+        &[
+            "update",
+            "all",
+            "--submit-only",
+            "--replace",
+            "--no-sync-regions",
+        ],
     );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -340,4 +349,50 @@ fn replacing_submission_cancels_the_unfinished_batch_and_reports_unconfigured_pu
             "/admin/state"
         ]
     );
+}
+
+#[test]
+fn work_exits_when_terminated_during_network_backoff() {
+    let unreachable = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let project = project(&unreachable);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_osm"))
+        .current_dir(project.path().parent().unwrap())
+        .env_clear()
+        .env("OSM_COMPUTE_WORKERS", "1")
+        .env("OSM_HTTP_ATTEMPTS", "1")
+        .env("OSM_HTTP_TIMEOUT_MS", "2000")
+        .env("OSM_HTTP_CONNECT_TIMEOUT_MS", "1000")
+        .arg("--root")
+        .arg(project.path())
+        .arg("work")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let backoff = lines
+        .by_ref()
+        .map(Result::unwrap)
+        .find(|line| line.contains("Network unavailable"));
+    assert!(backoff.is_some(), "work exited before a network backoff");
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("osm work did not exit after SIGTERM during a network backoff");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child.wait().unwrap().success());
 }

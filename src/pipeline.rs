@@ -1429,9 +1429,11 @@ pub fn submit(
     environment: &Environment,
     mode: &str,
     selection: &[String],
+    added: &[Region],
     replace: bool,
 ) -> Result<String> {
-    let entries = select_regions(root, selection)?;
+    let mut entries = select_regions(root, selection)?;
+    entries.extend(added.iter().cloned());
     let publisher = Publisher::new(runtime, &PublishConfig::from_environment(environment)?)?;
     let client = publisher.coordinator();
     if replace
@@ -1563,15 +1565,15 @@ fn fetch_user_countries(runtime: &Runtime, environment: &Environment) -> Result<
     parse_user_countries(&bytes)
 }
 
-pub fn sync_regions(
+pub fn missing_user_regions(
     root: &Path,
     runtime: &Runtime,
     environment: &Environment,
 ) -> Result<Vec<Region>> {
-    sync_regions_with_catalog(root, runtime, environment, None)
+    missing_user_regions_with_catalog(root, runtime, environment, None)
 }
 
-fn sync_regions_with_catalog(
+fn missing_user_regions_with_catalog(
     root: &Path,
     runtime: &Runtime,
     environment: &Environment,
@@ -1581,8 +1583,7 @@ fn sync_regions_with_catalog(
     if codes.is_empty() {
         return Ok(Vec::new());
     }
-    let regions_path = root.join("config/regions.json");
-    let mut configured = source::regions(&regions_path)?;
+    let configured = source::regions(&root.join("config/regions.json"))?;
     let catalog_bytes = match catalog_override {
         Some(path) => fs::read(path)?,
         None => {
@@ -1597,12 +1598,34 @@ fn sync_regions_with_catalog(
             fs::read(&catalog_path)?
         }
     };
-    let added = source::resolve_missing_countries(&configured, &catalog_bytes, &codes)?;
-    if !added.is_empty() {
-        configured.extend(added.iter().cloned());
-        source::write_regions(&regions_path, &configured)?;
+    source::resolve_missing_countries(&configured, &catalog_bytes, &codes)
+}
+
+fn record_regions(root: &Path, added: &[Region]) -> Result<()> {
+    let regions_path = root.join("config/regions.json");
+    let mut configured = source::regions(&regions_path)?;
+    configured.extend(added.iter().cloned());
+    source::write_regions(&regions_path, &configured)
+}
+
+pub fn sync_regions(
+    root: &Path,
+    runtime: &Runtime,
+    environment: &Environment,
+    submit: bool,
+) -> Result<(Vec<Region>, Option<String>)> {
+    let added = missing_user_regions(root, runtime, environment)?;
+    if added.is_empty() {
+        return Ok((added, None));
     }
-    Ok(added)
+    let batch = if submit {
+        let publisher = Publisher::new(runtime, &PublishConfig::from_environment(environment)?)?;
+        Some(publisher.coordinator().start("update", &added)?)
+    } else {
+        None
+    };
+    record_regions(root, &added)?;
+    Ok((added, batch))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1914,29 +1937,41 @@ fn execute_work(
         retry_delay,
         contacted,
         Arc::new(AtomicBool::new(false)),
-        |_| None,
+        |_| {},
     )
 }
 
-struct ShutdownListener(Option<Arc<tokio::sync::Notify>>);
+struct Shutdown {
+    stopping: Arc<AtomicBool>,
+    flow: Mutex<Weak<PipelineFlow>>,
+}
 
-impl Drop for ShutdownListener {
-    fn drop(&mut self) {
-        if let Some(notify) = self.0.take() {
-            notify.notify_one();
+impl Shutdown {
+    fn attach(&self, flow: &Arc<PipelineFlow>) {
+        *self.flow.lock().unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(flow);
+    }
+
+    fn drain(&self) {
+        self.stopping.store(true, Ordering::Release);
+        let flow = self
+            .flow
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade();
+        if let Some(flow) = flow {
+            flow.drain();
         }
     }
 }
 
-fn spawn_shutdown_listener(flow: &Arc<PipelineFlow>) -> Option<ShutdownListener> {
-    let stop_listener = Arc::new(tokio::sync::Notify::new());
-    let listener_stop = Arc::clone(&stop_listener);
-    let flow = Arc::clone(flow);
-    let runtime = tokio::runtime::Builder::new_current_thread()
+fn spawn_shutdown_listener(shutdown: Arc<Shutdown>) {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .ok()?;
-    std::thread::Builder::new()
+    else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
         .name("osm-signal".into())
         .spawn(move || {
             runtime.block_on(async move {
@@ -1947,21 +1982,24 @@ fn spawn_shutdown_listener(flow: &Arc<PipelineFlow>) -> Option<ShutdownListener>
                 let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
                     return;
                 };
-                tokio::select! {
-                    _ = terminate.recv() => {
-                        progress::message("Received SIGTERM; finishing active regional tasks before exit");
-                        flow.drain();
+                loop {
+                    let name = tokio::select! {
+                        _ = terminate.recv() => "SIGTERM",
+                        _ = interrupt.recv() => "SIGINT",
+                    };
+                    if shutdown.stopping.load(Ordering::Acquire) {
+                        progress::message(&format!(
+                            "Received {name} again; exiting before active regional tasks finish"
+                        ));
+                        std::process::exit(130);
                     }
-                    _ = interrupt.recv() => {
-                        progress::message("Received SIGINT; finishing active regional tasks before exit");
-                        flow.drain();
-                    }
-                    _ = listener_stop.notified() => {}
+                    progress::message(&format!(
+                        "Received {name}; finishing active regional tasks before exit"
+                    ));
+                    shutdown.drain();
                 }
             });
-        })
-        .ok()?;
-    Some(ShutdownListener(Some(stop_listener)))
+        });
 }
 
 fn execute_work_with_stopping(
@@ -1971,10 +2009,10 @@ fn execute_work_with_stopping(
     retry_delay: Duration,
     contacted: &AtomicBool,
     stopping: Arc<AtomicBool>,
-    listener: impl FnOnce(&Arc<PipelineFlow>) -> Option<ShutdownListener>,
+    attach: impl FnOnce(&Arc<PipelineFlow>),
 ) -> Result<()> {
     let flow = Arc::new(PipelineFlow::with_stopping(cleanup, stopping));
-    let _listener = listener(&flow);
+    attach(&flow);
     std::thread::scope(|scope| {
         let mut workers = Vec::new();
         for slot in 0..2 {
@@ -2033,9 +2071,10 @@ fn execute_work_with_stopping(
                             let mut waiting = false;
                             loop {
                                 flow.check()?;
+                                let reclaimable = flow.can_reclaim(slot);
                                 match operations.ready(&task) {
                                     Ok(()) => break,
-                                    Err(error) if flow.can_reclaim(slot) => {
+                                    Err(error) if reclaimable => {
                                         if !waiting {
                                             progress::message(&format!("Waiting for publication cleanup: {error}"));
                                             waiting = true;
@@ -2133,7 +2172,7 @@ fn wait_for_work(
         retry_delay,
         Arc::new(AtomicBool::new(false)),
         |_, duration| sleep(duration),
-        |_| None,
+        |_| {},
     )
 }
 
@@ -2144,7 +2183,7 @@ fn wait_for_work_with_stopping(
     retry_delay: Duration,
     stopping: Arc<AtomicBool>,
     mut sleep: impl FnMut(&AtomicBool, Duration),
-    mut listener: impl FnMut(&Arc<PipelineFlow>) -> Option<ShutdownListener>,
+    mut attach: impl FnMut(&Arc<PipelineFlow>),
 ) -> Result<()> {
     let contacted = AtomicBool::new(false);
     let mut attempt = 0_u32;
@@ -2159,7 +2198,7 @@ fn wait_for_work_with_stopping(
             retry_delay,
             &contacted,
             Arc::clone(&stopping),
-            &mut listener,
+            &mut attach,
         ) {
             Err(error) if crate::network::retryable(&error) => {
                 if stopping.load(Ordering::Acquire) {
@@ -2652,6 +2691,11 @@ pub fn work(
     fs::create_dir_all(&scratch)?;
     sweep_interrupted(data, &scratch)?;
     println!("Device {device}: waiting for regional tasks");
+    let shutdown = Arc::new(Shutdown {
+        stopping: Arc::new(AtomicBool::new(false)),
+        flow: Mutex::new(Weak::new()),
+    });
+    spawn_shutdown_listener(Arc::clone(&shutdown));
     wait_for_work_with_stopping(
         &CloudWork {
             runtime,
@@ -2669,7 +2713,7 @@ pub fn work(
         once,
         cleanup,
         Duration::from_secs(60),
-        Arc::new(AtomicBool::new(false)),
+        Arc::clone(&shutdown.stopping),
         |stopping, duration| {
             let deadline = std::time::Instant::now() + duration;
             while !stopping.load(Ordering::Acquire) {
@@ -2682,7 +2726,7 @@ pub fn work(
                 thread::sleep(remaining.min(Duration::from_millis(100)));
             }
         },
-        spawn_shutdown_listener,
+        |flow| shutdown.attach(flow),
     )
 }
 
@@ -5188,7 +5232,6 @@ mod tests {
                         stop_handle.store(true, Ordering::Release);
                         flow.drain();
                     });
-                    None
                 },
             )
             .unwrap();
@@ -5199,6 +5242,27 @@ mod tests {
         assert!(state.events.contains(&"cleanup:a".into()));
         assert!(state.events.contains(&"cleanup:b".into()));
         assert!(!state.events.contains(&"claim:c".into()));
+    }
+
+    #[test]
+    fn shutdown_requested_without_an_active_flow_prevents_the_next_claim() {
+        let operations = ScheduleOperations::new(ScheduleCase::Overlap);
+        let shutdown = Shutdown {
+            stopping: Arc::new(AtomicBool::new(false)),
+            flow: Mutex::new(Weak::new()),
+        };
+        shutdown.drain();
+        wait_for_work_with_stopping(
+            &operations,
+            false,
+            true,
+            Duration::from_secs(60),
+            Arc::clone(&shutdown.stopping),
+            |_, _| {},
+            |flow| shutdown.attach(flow),
+        )
+        .unwrap();
+        assert_eq!(operations.state.lock().unwrap().next, 0);
     }
 
     #[test]
@@ -5220,7 +5284,6 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(20));
                     flow.drain();
                 });
-                None
             },
         )
         .unwrap();
@@ -5336,9 +5399,14 @@ mod tests {
                 format!("http://{addr}/api/user_countries"),
             ),
         ]));
-        let added =
-            sync_regions_with_catalog(work.path(), &runtime(), &environment, Some(&catalog))
-                .unwrap();
+        let added = missing_user_regions_with_catalog(
+            work.path(),
+            &runtime(),
+            &environment,
+            Some(&catalog),
+        )
+        .unwrap();
+        record_regions(work.path(), &added).unwrap();
         server.join().unwrap();
 
         assert_eq!(

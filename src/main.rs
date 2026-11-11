@@ -78,10 +78,15 @@ enum Action {
             help = "Cancel an unfinished batch before submitting"
         )]
         replace: bool,
-        #[arg(long, help = "Skip syncing user countries before updating all regions")]
+        #[arg(
+            long,
+            help = "Skip adding new user countries when submitting all regions"
+        )]
         no_sync_regions: bool,
     },
-    #[command(about = "Detect new user countries and add missing regions to config/regions.json")]
+    #[command(
+        about = "Detect new user countries and record missing regions in config/regions.json"
+    )]
     SyncRegions {
         #[arg(long, help = "Submit an update batch for newly added regions")]
         submit: bool,
@@ -232,6 +237,7 @@ fn run(cli: Cli) -> Result<()> {
                     &environment,
                     "bootstrap",
                     regions,
+                    &[],
                     *replace
                 )?
             );
@@ -243,35 +249,41 @@ fn run(cli: Cli) -> Result<()> {
             replace,
             no_sync_regions,
         } => {
-            if !*no_sync_regions && *regions == ["all"] {
-                for entry in pipeline::sync_regions(&root, &runtime, &environment)? {
-                    println!("Added region: {} ({})", entry.id, entry.extract);
-                }
+            let added = if !*no_sync_regions && *regions == ["all"] {
+                pipeline::missing_user_regions(&root, &runtime, &environment)?
+            } else {
+                Vec::new()
+            };
+            for entry in &added {
+                println!(
+                    "New user region: {} ({}); run osm sync-regions to record it",
+                    entry.id, entry.extract
+                );
             }
             println!(
                 "Submitted batch: {}",
-                pipeline::submit(&root, &runtime, &environment, "update", regions, *replace)?
+                pipeline::submit(
+                    &root,
+                    &runtime,
+                    &environment,
+                    "update",
+                    regions,
+                    &added,
+                    *replace
+                )?
             );
             return Ok(());
         }
         Action::SyncRegions { submit } => {
-            let added = pipeline::sync_regions(&root, &runtime, &environment)?;
+            let (added, batch) = pipeline::sync_regions(&root, &runtime, &environment, *submit)?;
             if added.is_empty() {
                 println!("No new user countries to add");
-                return Ok(());
             }
             for entry in &added {
                 println!("Added region: {} ({})", entry.id, entry.extract);
             }
-            if *submit {
-                let ids = added
-                    .iter()
-                    .map(|entry| entry.id.clone())
-                    .collect::<Vec<_>>();
-                println!(
-                    "Submitted batch: {}",
-                    pipeline::submit(&root, &runtime, &environment, "update", &ids, false)?
-                );
+            if let Some(batch) = batch {
+                println!("Submitted batch: {batch}");
             }
             return Ok(());
         }
@@ -330,26 +342,15 @@ fn run(cli: Cli) -> Result<()> {
             None,
             cleanup,
         )?,
-        Action::Update {
-            regions,
-            no_sync_regions,
-            ..
-        } => {
-            if !no_sync_regions && regions == ["all"] {
-                for entry in pipeline::sync_regions(&root, &runtime, &environment)? {
-                    println!("Added region: {} ({})", entry.id, entry.extract);
-                }
-            }
-            pipeline::run(
-                &root,
-                &runtime,
-                &environment,
-                "update",
-                &regions,
-                None,
-                false,
-            )?
-        }
+        Action::Update { regions, .. } => pipeline::run(
+            &root,
+            &runtime,
+            &environment,
+            "update",
+            &regions,
+            None,
+            false,
+        )?,
         Action::SyncRegions { .. } => unreachable!(),
         Action::Publish { directory } => {
             let publisher =
